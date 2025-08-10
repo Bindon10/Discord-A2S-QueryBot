@@ -1,3 +1,2 @@
-a2s
+python-a2s
 requests
-time
