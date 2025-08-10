@@ -166,6 +166,7 @@ When all example entries are gone, pings are enabled.
 
 **🔸 “Why isn’t it pinging me?”**  
 - You’re still in **example mode**. Remove or replace all example servers in `servers.json`.
+- You set the wrong Discord ID in the script/servers.json
 
 **🔸 “Why does it say ‘Restart time not configured’?”**  
 - You set `"restart": true` but didn’t set `restart_hour` and `restart_minute`.
