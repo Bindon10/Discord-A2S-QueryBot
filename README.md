@@ -43,7 +43,7 @@ pip install a2s requests
 
 ### 4. First run
 ```bash
-python bot.py
+python a2s-status.py
 ```
 - On first run, it creates a sample `servers.json` file and runs in **example mode**:
   - Shows a yellow embed in Discord
