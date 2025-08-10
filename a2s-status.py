@@ -1,7 +1,8 @@
-# Discord-A2S-QueryBot v1.3.1 — Restart Time accepts strings/numbers + validation
-# - restart_hour / restart_minute can be "09", 9, "0", 0, etc.
-# - Validates ranges (hour 0–23, minute 0–59); warns if invalid/missing
-# - Keeps first-run example mode (no pings) and yellow example embed
+# Discord-A2S-QueryBot v1.4 — Multi-Webhook Routing + Example Mode + Restart Config
+# - NEW: Route embeds by (group, webhook_url) so multiple channels under same group name work.
+# - Auto-migrates old message_ids.json (group-only keys) by resetting it once.
+# - Keeps example mode (ip "0.0.0.0" => no pings, yellow embed) and restart time validation
+# - restart_hour/minute accept strings or numbers (e.g., "09", 9)
 
 import a2s
 import requests
@@ -17,6 +18,7 @@ DEFAULT_WEBHOOK_URL = "https://discord.com/api/webhooks/CHANGE_ME"
 INTERVAL_SECONDS = 60
 DEFAULT_USER_PING_ID = "<@123456789012345678>"
 
+# State
 message_ids = {}
 ping_message_ids = {}
 server_down = {}
@@ -34,17 +36,24 @@ def save_json(filename, data):
     with open(filename, "w") as f:
         json.dump(data, f, indent=2)
 
+# Preload state files (they'll be {} if missing)
 message_ids = load_json("message_ids.json")
 ping_message_ids = load_json("ping_message_ids.json")
 server_down = load_json("server_down.json")
 has_pinged_down = load_json("has_pinged_down.json")
+
+# --- One-time migration: if message_ids keys don't contain route separator '|', reset ---
+if message_ids and any("|" not in k for k in list(message_ids.keys())):
+    print("[INIT] Detected legacy message_ids.json (group-only keys). Resetting for route-based keys.")
+    message_ids = {}
+    save_json("message_ids.json", message_ids)
 
 # === Example config ===
 def create_example_servers_file():
     example_servers = [
         {
             "name": "⚠️ Example Server — Please Edit servers.json",
-            "ip": "0.0.0.0",
+            "ip": "0.0.0.0",              # sentinel: example mode
             "port": 27015,
             "group": "Example Group",
             "restart": True,
@@ -79,6 +88,9 @@ def load_servers_and_detect_example_mode():
 def make_server_key(ip, port):
     return f"{ip}:{port}"
 
+def route_key(group, webhook):
+    return f"{group}|{webhook}"
+
 # === A2S ===
 def fetch_stats(ip, port):
     addr = (ip, port)
@@ -102,7 +114,6 @@ def _to_int_or_none(v):
     if v is None:
         return None
     try:
-        # Handles "09", "9", 9, etc.
         return int(str(v).strip())
     except Exception:
         return None
@@ -123,14 +134,16 @@ def parse_restart_time(server):
 
     if h is None or m is None:
         return None, None, "missing"
-
     if not (0 <= h <= 23) or not (0 <= m <= 59):
         return None, None, "invalid"
-
     return h, m, None
 
 # === Discord ===
 def build_grouped_embeds(grouped_servers):
+    """
+    grouped_servers: { group_name: [(server_dict, stats_dict), ...] }
+    returns: { group_name: [embed, embed, ...] }
+    """
     group_embeds = {}
     for group_name, pairs in grouped_servers.items():
         embeds = []
@@ -166,7 +179,7 @@ def build_grouped_embeds(grouped_servers):
             embed = {
                 "title": f"🎮 {group_name} — {server['name']}",
                 "description": desc,
-                "color": 0x7F00FF,
+                "color": 0x7F00FF,  # default purple
                 "timestamp": datetime.utcnow().isoformat(),
                 "footer": {"text": "Updated every 60 seconds"},
             }
@@ -187,6 +200,11 @@ def build_grouped_embeds(grouped_servers):
     return group_embeds
 
 def send_initial_messages(grouped_embeds, group_webhooks):
+    """
+    grouped_embeds: {group: [embeds]}
+    group_webhooks: {group: webhook_url}
+    returns: {group: message_id}
+    """
     new_ids = {}
     for group, embeds in grouped_embeds.items():
         webhook = group_webhooks.get(group, DEFAULT_WEBHOOK_URL)
@@ -256,17 +274,23 @@ if __name__ == "__main__":
 
     # Loop
     while True:
-        grouped = {}
-        group_webhooks = {}
+        grouped_routes = {}   # route_key -> list[(server, stats)]
+        route_webhooks = {}   # route_key -> webhook_url
+
         for s in servers:
             name = s["name"]
             group = s.get("group", "Ungrouped")
             ip, port = s["ip"], s["port"]
             key = make_server_key(ip, port)
+            effective_webhook = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+            rk = route_key(group, effective_webhook)
 
             stats = fetch_stats(ip, port)
             if stats:
-                grouped.setdefault(group, []).append((s, stats))
+                grouped_routes.setdefault(rk, []).append((s, stats))
+                if rk not in route_webhooks:
+                    route_webhooks[rk] = effective_webhook
+
                 print(f"[{datetime.now()}] {name} is up: {stats['players']} on {stats['map']}")
 
                 if server_down.get(key, False):
@@ -292,21 +316,23 @@ if __name__ == "__main__":
                                 ping_message_ids[key] = pid
                                 save_json("ping_message_ids.json", ping_message_ids)
 
-            if group not in group_webhooks:
-                group_webhooks[group] = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+        # Send/Edit per route (group + webhook)
+        if grouped_routes:
+            for rk, pairs in grouped_routes.items():
+                group_name, webhook_url = rk.split("|", 1)
+                # build embeds using existing builder (expects {group_name: pairs})
+                built = build_grouped_embeds({group_name: pairs})
+                embeds = built[group_name]
 
-        if grouped:
-            embeds_by_group = build_grouped_embeds(grouped)
-            for group, embeds in embeds_by_group.items():
-                webhook_url = group_webhooks.get(group, DEFAULT_WEBHOOK_URL)
-                if group in message_ids:
-                    edit_discord_message(group, message_ids[group], embeds, webhook_url)
+                if rk in message_ids:
+                    edit_discord_message(group_name, message_ids[rk], embeds, webhook_url)
                 else:
-                    new_ids = send_initial_messages({group: embeds}, group_webhooks)
-                    if group in new_ids:
-                        message_ids[group] = new_ids[group]
+                    new_ids = send_initial_messages({group_name: embeds}, {group_name: webhook_url})
+                    if group_name in new_ids:
+                        message_ids[rk] = new_ids[group_name]
                         save_json("message_ids.json", message_ids)
 
+        # Persist state each loop
         save_json("server_down.json", server_down)
         save_json("has_pinged_down.json", has_pinged_down)
 
