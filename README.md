@@ -22,7 +22,8 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 
 ## 📦 Requirements
 - Python 3.9+
-- `pip install a2s requests`
+- python-a2s
+- requests
 - A Discord webhook URL for your channel
 
 ---
@@ -34,7 +35,7 @@ Clone or download this repository.
 
 ### 2. Install dependencies
 ```bash
-pip install a2s requests
+pip install python-a2s requests
 ```
 
 ### 3. Configure Discord webhook
