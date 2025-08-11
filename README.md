@@ -183,6 +183,23 @@ When all example entries are gone, pings are enabled.
 **🔸 “Multiple servers are in one embed when I don’t want that.”**  
 - Set a unique `"group"` name for each server you want in a separate embed.
 
+**🔸 “How do I set up the Steam API for downtime detection?”**  
+- This feature lets the bot check Steam’s backend health after **two failed queries** to avoid false pings during maintenance.  
+- **Get your API key**: https://steamcommunity.com/dev/apikey  
+  - Sign in with your Steam account.  
+  - Enter any domain (can be `localhost`).  
+  - Click **Register** and copy your key.  
+- **Add it to the bot**: In the script, find:  
+  ```python
+  STEAM_API_KEY = "PUT_YOUR_STEAM_WEB_API_KEY_HERE"
+  ```
+  Replace `"PUT_YOUR_STEAM_WEB_API_KEY_HERE"` with your key.  
+- When enabled:
+  - If Steam is unhealthy, downtime counters freeze.
+  - A banner is added to embeds: “⚠️ Steam may be down at the moment”.
+  - The bot ignores noisy keys like `IEconItems` that are often offline.
+- If not set, the bot will skip Steam health checks and use the old 3-fail rule for pings.
+
 ---
 
 ## 📄 License
