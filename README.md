@@ -1,19 +1,36 @@
-# Discord‑A2S‑QueryBot (v2.0.0)
+# Discord-A2S-QueryBot (v2.0.0)
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
 
 ---
 
-## ✨ What’s new in 2.0.0
+## ✨ Features
+- **Live Discord embeds**: server name, map, player count, and player list.
+- **Optional restart schedule** per server (with local-time display).
+- **Down detection + pings** with per-server overrides (`ping_id` or `ping_role_id`).
+- **Flexible routing/merging**: same **group + webhook** → one message; otherwise separate messages. No “Ungrouped” filler.
+- **Per-server-only setup supported**: `DEFAULT_WEBHOOK_URL` can stay `CHANGE_ME` if each server has its own `webhook_url`.
+- **Alerts webhook (optional)** for critical errors/warnings (deduped). Falls back to **console** if unset.
+- **Message ID resilience**: re-creates missing messages and updates `message_ids.json` automatically.
+- **Optional stale cleanup** of message IDs (`STALE_PURGE_ENABLED`).
+- **Embed safety**: trims to Discord limits (10 embeds/message, 4096 chars/description) and sanitizes player names.
+- **Rate-limit backoff** + **session reuse** for reliable Discord API calls.
+- **Graceful shutdown** persists state on exit.
+- **Example mode** on first run (no pings until you replace sample config).
+- Works with any game that supports **Steam A2S** (Source, GoldSrc, UE servers exposing A2S, etc.).
+
+---
+
+## 🆕 What’s new in 2.0.0
 - **Role pings** (`ping_role_id`) with safe `allowed_mentions`.
-- **Rate‑limit backoff** (handles Discord `429` and transient `5xx` with retries + jitter).
+- **Rate-limit backoff** (handles Discord `429` and transient `5xx` with retries + jitter).
 - **Embed safeguards** (player list sanitization + length caps; trims to 10 embeds/message).
 - **Session reuse** for fewer HTTP handshakes.
 - **Graceful shutdown** (saves state on SIGINT/SIGTERM).
-- **Per‑server‑only setups supported** — it’s OK if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME` as long as each server has its own `webhook_url`.
+- **Per-server-only setups supported** — it’s OK if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME` as long as each server has its own `webhook_url`.
 - **Safe timezone fallback** (`ZoneInfo` fallback to UTC if a timezone is invalid).
-- **Quiet, de‑duplicated alerts** to an optional Alerts webhook (or just console).
+- **Quiet, de-duplicated alerts** to an optional Alerts webhook (or just console).
 
 ---
 
@@ -21,9 +38,9 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 - Python **3.9+**
 - `python-a2s`
 - `requests`
-- A Discord **Webhook URL** (at least one — either a default or per‑server override)
+- A Discord **Webhook URL** (at least one — either a default or per-server override)
 
-Install dependencies:
+Install deps:
 ```bash
 pip install python-a2s requests
 ```
@@ -34,7 +51,7 @@ pip install python-a2s requests
 1) **Download** or clone this repo.
 2) Open `a2s-status.py`. All user settings are at the **top** under `# === USER CONFIG (edit me) ===`.
 3) Pick one of these setups:
-   - **Per‑server only (recommended for multi‑channel):** leave `DEFAULT_WEBHOOK_URL` as `CHANGE_ME`, and put a `webhook_url` on each server in `servers.json`.
+   - **Per-server only (recommended for multi-channel):** leave `DEFAULT_WEBHOOK_URL` as `CHANGE_ME`, and put a `webhook_url` on each server in `servers.json`.
    - **Single channel for everything:** set `DEFAULT_WEBHOOK_URL` and omit `webhook_url` on servers you want routed there.
 4) **First run**:
 ```bash
@@ -47,8 +64,8 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 ## ⚙️ User Config (top of script)
 | Setting | Purpose | Tips |
 |---|---|---|
-| `DEFAULT_WEBHOOK_URL` | Fallback webhook for servers without their own `webhook_url`. | Can stay `CHANGE_ME` if you only use per‑server webhooks. |
-| `ALERTS_WEBHOOK` | Optional webhook for **errors/warnings only**. | Leave empty to log alerts to console. Alerts are de‑duplicated. |
+| `DEFAULT_WEBHOOK_URL` | Fallback webhook for servers without their own `webhook_url`. | Can stay `CHANGE_ME` if you only use per-server webhooks. |
+| `ALERTS_WEBHOOK` | Optional webhook for **errors/warnings only**. | Leave empty to log alerts to console. Alerts are de-duplicated. |
 | `INTERVAL_SECONDS` | How often embeds refresh. | Default `60`.
 | `DEFAULT_USER_PING_ID` | Default mention when a server goes down. | Set to `""` to disable default pings. |
 | `STEAM_STATUS_CHECK_ENABLED` | Enable Steam backend health gate. | Requires `STEAM_API_KEY` to do anything. |
@@ -75,9 +92,9 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `timezone` | ❌ | string | IANA TZ (e.g. `"America/Edmonton"`). Falls back to UTC if invalid. |
 | `emoji` | ❌ | string | Emoji to decorate the title (e.g., `"⚔️"`). |
 | `icon_url` | ❌ | string | Thumbnail URL (overrides emoji). |
-| `webhook_url` | ❌ | string | Per‑server webhook override. |
-| `ping_id` | ❌ | string | Per‑server user mention for down pings (e.g., `<@123...>`). |
-| `ping_role_id` | ❌ | string/int | Per‑server **role** mention for down pings (e.g., role id `987654...`). |
+| `webhook_url` | ❌ | string | Per-server webhook override. |
+| `ping_id` | ❌ | string | Per-server user mention for down pings (e.g., `<@123...>`). |
+| `ping_role_id` | ❌ | string/int | Per-server **role** mention for down pings (e.g., role id `987654...`). |
 
 ### Example
 ```json
@@ -112,9 +129,9 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 ## 🧩 Grouping & routing
 - Servers **merge into a single message** only when **both** the `group` **and** the **webhook URL** match.
 - If `group` is empty, the server **never merges**; its embed title shows just the server name (no “Ungrouped”).
-- If a Discord status **message is deleted**, the bot **re‑creates** it and updates `message_ids.json` automatically.
+- If a Discord status **message is deleted**, the bot **re-creates** it and updates `message_ids.json` automatically.
 - If a server’s **webhook changes**, Discord won’t allow editing the old message via the new webhook. The bot will create a **new** message and track that going forward.
-- **Per‑server‑only setups:** it’s fine if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME`. Routes that would rely on the default produce a small **route‑scoped** notice and are skipped; everything with a real `webhook_url` works normally.
+- **Per-server-only setups:** it’s fine if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME`. Routes that would rely on the default produce a small **route-scoped** notice and are skipped; everything with a real `webhook_url` works normally.
 
 ---
 
@@ -135,11 +152,11 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 ---
 
 ## 🛡️ Safeguards & reliability
-- **Rate‑limit backoff:** automatic retry on `429` (`Retry‑After`) and transient `5xx` with jittered backoff.
+- **Rate-limit backoff:** automatic retry on `429` (`Retry-After`) and transient `5xx` with jittered backoff.
 - **Session reuse:** persistent `requests.Session` for fewer TCP handshakes.
 - **Embed safety:** trims to 10 embeds per message; escape basic Markdown in player names; caps embed description to 4096 chars.
 - **Graceful shutdown:** handles SIGINT/SIGTERM and persists state files (`message_ids.json`, `ping_message_ids.json`, `server_down.json`).
-- **Stale IDs (optional):** set `STALE_PURGE_ENABLED=True` to auto‑remove message IDs that no longer correspond to any configured route. The bot protects expected routes during downtime so it won’t delete active messages just because servers are temporarily unreachable.
+- **Stale IDs (optional):** set `STALE_PURGE_ENABLED=True` to auto-remove message IDs that no longer correspond to any configured route. The bot protects expected routes during downtime so it won’t delete active messages just because servers are temporarily unreachable.
 
 ---
 
@@ -175,7 +192,7 @@ How to get a key:
 - Discord doesn’t allow editing a message from a **different** webhook. The bot will post a **new** message and track that ID going forward.
 
 **“I hit Discord rate limits.”**
-- The bot obeys `Retry‑After` and backs off automatically. If you see many rate‑limit logs, consider raising `INTERVAL_SECONDS`.
+- The bot obeys `Retry-After` and backs off automatically. If you see many rate-limit logs, consider raising `INTERVAL_SECONDS`.
 
 ---
 
