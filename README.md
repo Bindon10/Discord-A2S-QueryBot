@@ -1,4 +1,4 @@
-# Discord-A2S-QueryBot (v2.0.0)
+# Discord-A2S-QueryBot (v2.0.1)
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -22,7 +22,7 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 
 ---
 
-## 🆕 What’s new in 2.0.0
+## 🆕 What’s new in 2.0.1
 - **Role pings** (`ping_role_id`) with safe `allowed_mentions`.
 - **Rate-limit backoff** (handles Discord `429` and transient `5xx` with retries + jitter).
 - **Embed safeguards** (player list sanitization + length caps; trims to 10 embeds/message).
@@ -31,6 +31,8 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 - **Per-server-only setups supported** — it’s OK if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME` as long as each server has its own `webhook_url`.
 - **Safe timezone fallback** (`ZoneInfo` fallback to UTC if a timezone is invalid).
 - **Quiet, de-duplicated alerts** to an optional Alerts webhook (or just console).
+- **Feature: Per-server player list toggle via "show_players": false in servers.json.
+- **Config: Global default SHOW_PLAYERS_BY_DEFAULT = True (top of script).
 
 ---
 
@@ -95,6 +97,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `webhook_url` | ❌ | string | Per-server webhook override. |
 | `ping_id` | ❌ | string | Per-server user mention for down pings (e.g., `<@123...>`). |
 | `ping_role_id` | ❌ | string/int | Per-server **role** mention for down pings (e.g., role id `987654...`). |
+| 'show_players' | ❌ | string | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
 
 ### Example
 ```json

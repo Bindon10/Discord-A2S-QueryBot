@@ -1,4 +1,4 @@
-# Discord-A2S-QueryBot v2.0.0 — Role Pings + Rate-Limit Backoff + Embed Safeguards + Session Reuse + Graceful Shutdown
+# Discord-A2S-QueryBot v2.0.1 — Role Pings + Rate-Limit Backoff + Embed Safeguards + Session Reuse + Graceful Shutdown
 # Small hardening tweaks: placeholder-webhook guard, safe timezone fallback, sanitized player names, minor cleanup.
 
 import a2s
@@ -48,6 +48,7 @@ DOWN_FAIL_THRESHOLD = 3        # consecutive failures before a server is conside
 GROUP_EMBED_LIMIT   = 10       # Discord hard cap per message
 EMBED_DESC_LIMIT    = 4096     # Discord hard cap per embed description
 STALE_PURGE_ENABLED = False    # if True, purge message_ids for routes no longer present in config
+SHOW_PLAYERS_BY_DEFAULT = True # default: show player list in embeds (override per-server with 'show_players')
 
 # === INTERNAL (you usually don't need to touch below this line) ===
 CONFIG_FILE = "servers.json"
@@ -463,12 +464,17 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
     for group_name, pairs in grouped_servers.items():
         embeds = []
         for server, stats in pairs:
+            # Header
             header = (
-                f"**{stats['name']}**\n\n"
-                f"📜 Map: `{stats['map']}`\n"
+                f"**{stats['name']}**
+
+"
+                f"📜 Map: `{stats['map']}`
+"
                 f"👥 Players: `{stats['players']} / {stats['max_players']}`"
             )
 
+            # Optional restart block
             body_lines = []
             h, m, err = parse_restart_time(server)
             if server.get("restart", False):
@@ -485,29 +491,51 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     print(f"[WARN] Restart time invalid for '{server.get('name','?')}'. Use hour 0–23 and minute 0–59.")
                     body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
 
-            body = ("\n\n" + "\n".join(body_lines)) if body_lines else ""
+            body = ("
 
-            if stats["player_names"]:
-                names = []
-                for n in stats["player_names"][: stats["max_players"]]:
-                    names.append(f"- {_san(n)}")
-                    test_desc = (
-                        (steam_banner or "")
-                        + header
-                        + body
-                        + "\n\n**Current Players:**\n"
-                        + "\n".join(names)
-                    )
-                    if len(test_desc) > EMBED_DESC_LIMIT:
-                        names.pop()
-                        names.append("…")
-                        break
-                players_block = "\n".join(names)
-            else:
-                players_block = "*No players online*"
+" + "
+".join(body_lines)) if body_lines else ""
 
+            # Player list (toggleable; per-server override via "show_players": false)
+            show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
+            players_block = None
+            if show_players:
+                if stats["player_names"]:
+                    names = []
+                    for n in stats["player_names"][: stats["max_players"]]:
+                        names.append(f"- {_san(n)}")
+                        test_desc = (
+                            (steam_banner or "")
+                            + header
+                            + body
+                            + "
+
+**Current Players:**
+"
+                            + "
+".join(names)
+                        )
+                        if len(test_desc) > EMBED_DESC_LIMIT:
+                            names.pop()
+                            names.append("…")
+                            break
+                    players_block = "
+".join(names)
+                else:
+                    players_block = "*No players online*"
+
+            # Build description with clean spacing
             banner = (steam_banner or "").strip()
-            desc = ((banner + "\n\n") if banner else "") + header + body + "\n\n**Current Players:**\n" + players_block
+            parts = []
+            if banner:
+                parts.append(banner)
+            parts.append(header + body)
+            if show_players:
+                parts.append("**Current Players:**
+" + players_block)
+            desc = "
+
+".join(parts)
             desc = _truncate(desc, EMBED_DESC_LIMIT)
 
             icon = server.get("icon_url") or server.get("emoji")
@@ -532,6 +560,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
 
             embeds.append(embed)
 
+        # Cap to Discord's 10-embed limit per message
         if len(embeds) > GROUP_EMBED_LIMIT:
             alert_issue(
                 "Embed limit exceeded",
@@ -689,7 +718,7 @@ def route_key(display_key, webhook):
 
 # === MAIN ===
 if __name__ == "__main__":
-    print("[A2S Bot] Starting Discord-A2S-QueryBot v2.0.0 (user-config at top)")
+    print("[A2S Bot] Starting Discord-A2S-QueryBot v2.0.1 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
