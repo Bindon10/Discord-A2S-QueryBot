@@ -4,6 +4,11 @@ A lightweight **Steam A2S query bot** for Discord that displays live server info
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
 
 ---
+## 📸 Example Screenshot
+
+![alt text](https://i.imgur.com/b14Bp1o.png)
+
+---
 
 ## ✨ Features
 - **Live Discord embeds**: server name, map, player count, and player list.
