@@ -539,7 +539,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
             desc = _truncate(desc, EMBED_DESC_LIMIT)
 
             icon = server.get("icon_url") or server.get("emoji")
-            title_text = f"🎮 {group_name} — {server['name']}" if group_name else f"🎮 {server['name']}"
+            title_text = f" {group_name} — {server['name']}" if group_name else f"🎮 {server['name']}"
 
             embed = {
                 "title": title_text,
