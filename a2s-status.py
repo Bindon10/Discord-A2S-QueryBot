@@ -466,11 +466,8 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
         for server, stats in pairs:
             # Header
             header = (
-                f"**{stats['name']}**
-
-"
-                f"📜 Map: `{stats['map']}`
-"
+                f"**{stats['name']}**\n\n"
+                f"📜 Map: `{stats['map']}`\n"
                 f"👥 Players: `{stats['players']} / {stats['max_players']}`"
             )
 
@@ -491,10 +488,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     print(f"[WARN] Restart time invalid for '{server.get('name','?')}'. Use hour 0–23 and minute 0–59.")
                     body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
 
-            body = ("
-
-" + "
-".join(body_lines)) if body_lines else ""
+            body = ("\n\n" + "\n".join(body_lines)) if body_lines else ""
 
             # Player list (toggleable; per-server override via "show_players": false)
             show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
@@ -508,19 +502,14 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                             (steam_banner or "")
                             + header
                             + body
-                            + "
-
-**Current Players:**
-"
-                            + "
-".join(names)
+                            + "\n\n**Current Players:**\n"
+                            + "\n".join(names)
                         )
                         if len(test_desc) > EMBED_DESC_LIMIT:
                             names.pop()
                             names.append("…")
                             break
-                    players_block = "
-".join(names)
+                    players_block = "\n".join(names)
                 else:
                     players_block = "*No players online*"
 
@@ -531,11 +520,8 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 parts.append(banner)
             parts.append(header + body)
             if show_players:
-                parts.append("**Current Players:**
-" + players_block)
-            desc = "
-
-".join(parts)
+                parts.append("**Current Players:**\n" + players_block)
+            desc = "\n\n".join(parts)
             desc = _truncate(desc, EMBED_DESC_LIMIT)
 
             icon = server.get("icon_url") or server.get("emoji")
