@@ -18,7 +18,7 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 - **Rate-limit backoff** + **session reuse** for reliable Discord API calls.
 - **Graceful shutdown** persists state on exit.
 - **Example mode** on first run (no pings until you replace sample config).
-- **Works with any game that supports **Steam A2S** (Source, GoldSrc, UE servers exposing A2S, etc.).
+- Works with any game that supports **Steam A2S** (Source, GoldSrc, UE servers exposing A2S, etc.).
 
 ---
 
@@ -31,8 +31,8 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 - **Per-server-only setups supported** — it’s OK if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME` as long as each server has its own `webhook_url`.
 - **Safe timezone fallback** (`ZoneInfo` fallback to UTC if a timezone is invalid).
 - **Quiet, de-duplicated alerts** to an optional Alerts webhook (or just console).
-- **Feature: Per-server player list toggle via "show_players": false in servers.json.
-- **Config: Global default SHOW_PLAYERS_BY_DEFAULT = True (top of script).
+- **Feature:** Per-server player list toggle via "show_players": false in servers.json.
+- **Config:** Global default SHOW_PLAYERS_BY_DEFAULT = True (top of script).
 
 ---
 
