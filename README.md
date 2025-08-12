@@ -18,7 +18,7 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 - **Rate-limit backoff** + **session reuse** for reliable Discord API calls.
 - **Graceful shutdown** persists state on exit.
 - **Example mode** on first run (no pings until you replace sample config).
-- Works with any game that supports **Steam A2S** (Source, GoldSrc, UE servers exposing A2S, etc.).
+- **Works with any game that supports **Steam A2S** (Source, GoldSrc, UE servers exposing A2S, etc.).
 
 ---
 
