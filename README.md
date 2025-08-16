@@ -27,17 +27,9 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 
 ---
 
-## 🆕 What’s new in 2.0.1
-- **Role pings** (`ping_role_id`) with safe `allowed_mentions`.
-- **Rate-limit backoff** (handles Discord `429` and transient `5xx` with retries + jitter).
-- **Embed safeguards** (player list sanitization + length caps; trims to 10 embeds/message).
-- **Session reuse** for fewer HTTP handshakes.
-- **Graceful shutdown** (saves state on SIGINT/SIGTERM).
-- **Per-server-only setups supported** — it’s OK if `DEFAULT_WEBHOOK_URL` is still `CHANGE_ME` as long as each server has its own `webhook_url`.
-- **Safe timezone fallback** (`ZoneInfo` fallback to UTC if a timezone is invalid).
-- **Quiet, de-duplicated alerts** to an optional Alerts webhook (or just console).
-- **Feature:** Per-server player list toggle via "show_players": false in servers.json.
-- **Config:** Global default SHOW_PLAYERS_BY_DEFAULT = True (top of script).
+## 🆕 What’s new in 2.0.2d
+- **Passworded server query** Displays if a server is password protected (with Show_visibility_by_default or show_visibility in servers.json).
+- **Debug Logging** (Enables a debug.log in case of issues, this is untested).
 
 ---
 
@@ -83,6 +75,8 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `GROUP_EMBED_LIMIT` | Max embeds per message. | Discord hard cap is 10. |
 | `EMBED_DESC_LIMIT` | Max characters in one embed description. | Discord hard cap is 4096. |
 | `STALE_PURGE_ENABLED` | Purge obsolete message IDs. | Leave `False` unless you want automatic cleanup. |
+| `SHOW_VISIBILITY_BY_DEFAULT` | Shows if a server is password protected | Leave false to hide this information by default. |
+| `DEBUG_LOG_ENABLED` | Enables debug logging to file in case of an issue | Defaults to false, messages still log to console. |
 
 ---
 
@@ -103,6 +97,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `ping_id` | ❌ | string | Per-server user mention for down pings (e.g., `<@123...>`). |
 | `ping_role_id` | ❌ | string/int | Per-server **role** mention for down pings (e.g., role id `987654...`). |
 | `show_players` | ❌ | string | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
+| `show_visibility` | ❌ | boolean | if SHOW_VISIBILITY_BY_DEFAULT is false, setting this to true in your servers.json will show if that specific server is password protected or public. |
 
 ### Example
 ```json
