@@ -1,4 +1,4 @@
-# Discord-A2S-QueryBot (v2.0.1)
+# Discord-A2S-QueryBot (v2.0.2d)
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -117,7 +117,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `webhook_url` | ❌ | string | Per-server webhook override. |
 | `ping_id` | ❌ | string | Per-server user mention for down pings (e.g., `<@123...>`). |
 | `ping_role_id` | ❌ | string/int | Per-server **role** mention for down pings (e.g., role id `987654...`). |
-| `show_players` | ❌ | string | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
+| `show_players` | ❌ | boolean | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
 | `show_visibility` | ❌ | boolean | if SHOW_VISIBILITY_BY_DEFAULT is false, setting this to true in your servers.json will show if that specific server is password protected or public. |
 
 ### Example
