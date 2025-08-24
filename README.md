@@ -27,9 +27,30 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 
 ---
 
-## 🆕 What’s new in 2.0.2d
-- **Passworded server query** Displays if a server is password protected (with Show_visibility_by_default or show_visibility in servers.json).
-- **Debug Logging** (Enables a debug.log in case of issues, this is untested).
+## 🆕 What’s new in 2.0.3
+
+### Added
+- **Hot reload of `servers.json`** (mtime watch). Reloads config without a restart and refreshes `servers.json.bak` after successful load.
+- **`.bak` diff cleanup** (on startup & reload):
+  - Deletes **route status messages** for routes removed or moved.
+  - Clears per-server state for removed servers and deletes any lingering **down-ping** message.
+  - **No pings** are sent for manual removals.
+- **Webhook allow-list (Discord only):** accepts only `https://` webhooks on `discord.com`, `discordapp.com`, `ptb.discord.com`, `canary.discord.com`. Invalid/placeholder webhooks are skipped and cached IDs pointing to them are pruned.
+- **Robust ping addressing:** supports `ping_role_id`, and `ping_id` as `<@123>`, `<@&123>`, or a bare numeric ID, with precise `allowed_mentions`.
+
+### Changed
+- **Down/Up lifecycle:**
+  - On hitting `DOWN_FAIL_THRESHOLD`, the bot sends **one** down ping and marks the server down.
+  - On recovery, it clears down flags, **deletes the down-ping message**, and **recreates the status message** (persisting the new message ID).
+- **Route status lifecycle:**
+  - If `CLEANUP_REMOVED_ROUTES = true`, routes missing from the current config have their **status messages deleted**.
+  - If `DELETE_ON_EMPTY_ROUTES = true`, routes with **no up servers** this cycle have their **status messages deleted** (recreated automatically when a server in the route comes back up).
+
+### Fixed
+- **Single ping at threshold:** ping fires exactly when crossing `DOWN_FAIL_THRESHOLD` and won’t repeat while the server remains down.
+
+### Safety
+- **Manual orphan cleanup:** `orphans_to_delete.json` (list of `{webhook_url, message_id}`) is processed on startup to delete known stragglers.
 
 ---
 
