@@ -1,4 +1,4 @@
-# Discord-A2S-QueryBot v2.0.3 — Hot Reload + .bak Diff Cleanup + Webhook Allow-List + Ping Fix
+# Discord-A2S-QueryBot v2.0.2d — Passworded server query + Debug Logging (untested)
 
 import a2s
 import requests
@@ -14,22 +14,38 @@ from zoneinfo import ZoneInfo
 import socket
 import logging
 from logging.handlers import RotatingFileHandler
-import urllib.parse
-import re
 
 # === USER CONFIG (edit me) ===
-DEBUG_LOG_ENABLED = False
+# Quick setup:
+# 1) Set DEFAULT_WEBHOOK_URL (master channel for servers without per-server override)
+# 2) (Optional) Set ALERTS_WEBHOOK for a debug/errors channel — or leave blank to log to console
+# 3) (Optional) Put your STEAM_API_KEY and keep STEAM_STATUS_CHECK_ENABLED=True to freeze during Steam-wide outages
+# 4) (Optional) Tweak INTERVAL_SECONDS and DOWN_FAIL_THRESHOLD
+# 5) (Optional) Toggle STALE_PURGE_ENABLED if you want message_id cleanup
+
+# Debug logging (global): console is always on at INFO; set True to also write DEBUG logs to debug.log (rotating).
+DEBUG_LOG_ENABLED = False  # Also save console logs to debug.log (rotates). Console output is always shown.
+
+# Required: master webhook for servers that don't specify their own `webhook_url` in servers.json
 DEFAULT_WEBHOOK_URL = "https://discord.com/api/webhooks/CHANGE_ME"
+
+# Optional: alerts/debug/warnings webhook (critical issues only).
+# Leave blank to log to console. You can also set the ALERTS_WEBHOOK env var.
 ALERTS_WEBHOOK = os.getenv("ALERTS_WEBHOOK", "").strip()
+
+# How often to refresh embeds (seconds)
 INTERVAL_SECONDS = 60
+
+# Default mention used for down pings when a server doesn't set `ping_id` or `ping_role_id`.
+# You can set this to "" to disable default pings.
 DEFAULT_USER_PING_ID = "<@123456789012345678>"
 
 # Steam backend health gate (optional). If enabled AND `STEAM_API_KEY` is set,
 # the bot freezes downtime counters during Steam-wide issues to avoid false alarms.
 STEAM_STATUS_CHECK_ENABLED = True
 STEAM_API_KEY = "PUT_YOUR_STEAM_WEB_API_KEY_HERE"   # https://steamcommunity.com/dev/apikey
-STEAM_STATUS_POLL_SECONDS = 180
-IGNORED_STEAM_SERVICE_KEYS = {"IEconItems"}
+STEAM_STATUS_POLL_SECONDS = 180                       # cache Steam health for this many seconds
+IGNORED_STEAM_SERVICE_KEYS = {"IEconItems"}          # noisy keys to ignore when judging health
 
 # Behavior knobs
 DOWN_FAIL_THRESHOLD = 3        # consecutive failures before a server is considered down (and pinged)
@@ -37,30 +53,26 @@ GROUP_EMBED_LIMIT   = 10       # Discord hard cap per message
 EMBED_DESC_LIMIT    = 4096     # Discord hard cap per embed description
 STALE_PURGE_ENABLED = False    # if True, purge message_ids for routes no longer present in config
 SHOW_PLAYERS_BY_DEFAULT = True # default: show player list in embeds (override per-server with 'show_players')
-SHOW_VISIBILITY_BY_DEFAULT = False # default: show visibility line
+SHOW_VISIBILITY_BY_DEFAULT = False # default: show visibility line (Public/Passworded) per server; override with 'show_visibility'
 
-# Cleanup controls
-DELETE_ON_EMPTY_ROUTES = True      # delete route's status message when no servers are up in that route
-CLEANUP_REMOVED_ROUTES = True      # delete route's status message if route no longer exists in config
-ORPHANS_FILE = "orphans_to_delete.json"  # optional manual cleanup list
+# === INTERNAL (you usually don't need to touch below this line) ===
 
-# Webhook allow-list (Discord-only)
-ALLOWED_WEBHOOK_HOSTS = {"discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"}
-
-# === INTERNAL ===
+# Debug logging setup: console always ON (INFO+); optional rotating file for DEBUG
 logger = logging.getLogger("a2sbot")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.DEBUG)  # master gate
+
 _console_handler = logging.StreamHandler(sys.stdout)
 _console_handler.setLevel(logging.INFO)
 _console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logger.addHandler(_console_handler)
+
 if DEBUG_LOG_ENABLED:
     _file_handler = RotatingFileHandler("debug.log", maxBytes=5 * 1024 * 1024, backupCount=3)
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     logger.addHandler(_file_handler)
 
-# HTTP session
+# === HTTP Session & helpers ===
 SESSION = requests.Session()
 try:
     from requests.adapters import HTTPAdapter
@@ -68,10 +80,11 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.3"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.2d"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
-    time.sleep(min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25))
+    delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
+    time.sleep(delay)
 
 def discord_request(method: str, url: str, *, json_payload=None, timeout: float = 15, max_retries: int = 3):
     """Request wrapper with 429 Retry-After + 5xx backoff. Returns (resp, errstr|None)."""
@@ -84,6 +97,7 @@ def discord_request(method: str, url: str, *, json_payload=None, timeout: float 
             _sleep_backoff(attempt)
             continue
 
+        # Global / regular 429
         if resp.status_code == 429:
             try:
                 ra = resp.headers.get("Retry-After")
@@ -98,6 +112,7 @@ def discord_request(method: str, url: str, *, json_payload=None, timeout: float 
                 return resp, f"429 Too Many Requests (gave up after {max_retries} retries)"
             continue
 
+        # Transient 5xx
         if 500 <= resp.status_code < 600:
             if attempt >= max_retries:
                 return resp, f"{resp.status_code} server error"
@@ -108,13 +123,11 @@ def discord_request(method: str, url: str, *, json_payload=None, timeout: float 
     return None, "exhausted retries"
 
 # === JSON IO ===
+
 def load_json(filename):
     if os.path.exists(filename):
         with open(filename, "r", encoding="utf-8") as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return {}
+            return json.load(f)
     return {}
 
 def save_json(filename, data):
@@ -130,6 +143,7 @@ def save_json(filename, data):
                 pass
         os.replace(tmp, filename)
     except Exception:
+        # Fallback best-effort
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
@@ -151,7 +165,7 @@ _last_steam_check = 0.0
 _last_steam_unhealthy = False
 _last_steam_snapshot = None
 
-# Restore prior net-freeze state if present
+# Restore prior net-freeze state if present (survives restarts)
 try:
     _ns = load_json("net_state.json")
     NET_FREEZE_ACTIVE = bool(_ns.get("active", False))
@@ -187,22 +201,31 @@ def net_probe_ok() -> bool:
     disc_ok = _https_ping_discord()
     return dns_ok and disc_ok
 
-# Migration to route-based keys
+# One-time migration to route-based keys
 if message_ids and any("|" not in k for k in list(message_ids.keys())):
-    logger.info("[INIT] Detected legacy message_ids.json; resetting for route-based keys.")
+    logger.info("[INIT] Detected legacy message_ids.json (group-only keys). Resetting for route-based keys.")
     message_ids = {}
     save_json("message_ids.json", message_ids)
 
 # === Example config ===
+
 CONFIG_FILE = "servers.json"
 
 def create_example_servers_file():
-    example_servers = [{
-        "name": "⚠️ Example Server — Please Edit servers.json",
-        "ip": "0.0.0.0", "port": 27015, "group": "Example Group",
-        "restart": True, "restart_hour": "04", "restart_minute": "30",
-        "timezone": "America/Edmonton", "emoji": "⚠️", "ping_id": "<@123456789012345678>"
-    }]
+    example_servers = [
+        {
+            "name": "⚠️ Example Server — Please Edit servers.json",
+            "ip": "0.0.0.0",  # sentinel triggers example mode
+            "port": 27015,
+            "group": "Example Group",
+            "restart": True,
+            "restart_hour": "04",
+            "restart_minute": "30",
+            "timezone": "America/Edmonton",
+            "emoji": "⚠️",
+            "ping_id": "<@123456789012345678>"
+        }
+    ]
     save_json(CONFIG_FILE, example_servers)
     logger.info("[INIT] Created example servers.json — edit this file and restart to begin monitoring real servers.")
 
@@ -222,7 +245,7 @@ def load_servers_and_detect_example_mode():
         return servers, True
     return servers, False
 
-# === ALERTS ===
+# === ALERTS HELPERS ===
 def _alerts_save():
     try:
         save_json("alerts_state.json", alerts_state)
@@ -269,26 +292,33 @@ def alert_issue(title: str, description: str, extras: dict | None = None, key: s
     }
     _post_alert({"embeds": [embed]})
 
-# === Steam Health ===
+# === Steam Health Check & Banner ===
 def _interpret_steam_health(payload) -> bool:
     try:
         result = payload.get("result") or payload.get("data") or payload
         suspicious, ignored = [], []
         services = result.get("services", {}) or {}
         matchmaking = result.get("matchmaking", {}) or {}
-        def bad(v): return isinstance(v, str) and v.lower() in ("offline", "critical", "degraded", "delayed")
+        def is_bad(v):
+            return isinstance(v, str) and v.lower() in ("offline", "critical", "degraded", "delayed")
         for k, v in services.items():
-            ((ignored if k in IGNORED_STEAM_SERVICE_KEYS else suspicious)
-             .append((f"services.{k}", v))) if bad(v) else None
+            if is_bad(v):
+                (ignored if k in IGNORED_STEAM_SERVICE_KEYS else suspicious).append((f"services.{k}", v))
         for k, v in matchmaking.items():
-            suspicious.append((f"matchmaking.{k}", v)) if bad(v) else None
+            if is_bad(v):
+                suspicious.append((f"matchmaking.{k}", v))
+        if suspicious:
+            logger.debug("[DEBUG] Steam unhealthy reasons (considered): %s", suspicious)
+        if ignored:
+            logger.debug("[DEBUG] Steam unhealthy reasons (ignored noisy): %s", ignored)
         return len(suspicious) > 0
-    except Exception:
+    except Exception as e:
+        logger.debug("[DEBUG] Failed to interpret Steam health (possible false unhealthy): %s", e)
         return False
 
 def steam_is_unhealthy() -> bool:
     global _last_steam_check, _last_steam_unhealthy, _last_steam_snapshot
-    if not (STEAM_STATUS_CHECK_ENABLED):
+    if not STEAM_HEALTH_ENABLED or not STEAM_STATUS_CHECK_ENABLED:
         return False
     if not STEAM_API_KEY or STEAM_API_KEY == "PUT_YOUR_STEAM_WEB_API_KEY_HERE":
         return False
@@ -299,36 +329,48 @@ def steam_is_unhealthy() -> bool:
     try:
         resp, err = discord_request("GET", url + f"?key={STEAM_API_KEY}", timeout=10)
         _last_steam_check = now
-        if not resp or resp.status_code in (403,) or (resp.status_code and resp.status_code != 200):
-            _last_steam_unhealthy = False; _last_steam_snapshot = None; return False
+        if not resp or resp.status_code == 403 or (resp.status_code and resp.status_code != 200):
+            _last_steam_unhealthy = False
+            _last_steam_snapshot = None
+            return False
         data = resp.json()
-        _last_steam_unhealthy = _interpret_steam_health(data)
+        unhealthy = _interpret_steam_health(data)
+        _last_steam_unhealthy = unhealthy
         _last_steam_snapshot = data
-        return _last_steam_unhealthy
-    except Exception:
-        _last_steam_check = now; _last_steam_unhealthy = False; _last_steam_snapshot = None
+        return unhealthy
+    except Exception as e:
+        logger.debug("[DEBUG] Steam API request error: %s. Treating as healthy this cycle.", e)
+        _last_steam_check = now
+        _last_steam_unhealthy = False
+        _last_steam_snapshot = None
         return False
 
 def _summarize_unhealthy_reasons(snapshot) -> list:
     try:
         result = (snapshot or {}).get("result") or (snapshot or {}).get("data") or (snapshot or {})
         out = []
-        def bad(v): return isinstance(v, str) and v.lower() in ("offline", "critical", "degraded", "delayed")
+        def bad(v: str) -> bool:
+            return isinstance(v, str) and v.lower() in ("offline", "critical", "degraded", "delayed")
         for k, v in (result.get("services", {}) or {}).items():
-            if bad(v) and k not in IGNORED_STEAM_SERVICE_KEYS: out.append(f"services.{k}: {v}")
+            if bad(v) and k not in IGNORED_STEAM_SERVICE_KEYS:
+                out.append(f"services.{k}: {v}")
         for k, v in (result.get("matchmaking", {}) or {}).items():
-            if bad(v): out.append(f"matchmaking.{k}: {v}")
+            if bad(v):
+                out.append(f"matchmaking.{k}: {v}")
         return out
     except Exception:
         return []
 
 def build_steam_banner(steam_unhealthy: bool, last_check_epoch: float, snapshot) -> str:
-    if not steam_unhealthy: return ""
-    checked = datetime.utcfromtimestamp(last_check_epoch).strftime("%H:%M:%S UTC") if last_check_epoch else "unknown"
+    if not steam_unhealthy:
+        return ""
     reasons = _summarize_unhealthy_reasons(snapshot)
+    checked = datetime.utcfromtimestamp(last_check_epoch).strftime("%H:%M:%S UTC") if last_check_epoch else "unknown"
     reason_text = (", ".join(reasons[:3]) + ("…" if len(reasons) > 3 else "")) if reasons else "unavailable"
-    return ("⚠️ **Steam may be down at the moment** — server status may be inaccurate.\n"
-            f"(last checked: {checked} • reasons: {reason_text})\n\n")
+    return (
+        "⚠️ **Steam may be down at the moment** — server status may be inaccurate.\n"
+        f"(last checked: {checked} • reasons: {reason_text})\n\n"
+    )
 
 # === A2S ===
 def fetch_stats(ip, port):
@@ -360,89 +402,80 @@ def fetch_stats(ip, port):
         logger.info("[INFO] Query failed for %s:%s: %s", ip, port, e)
         return None
 
-# === Restart parsing ===
+# === Restart parsing (accept strings OR numbers) ===
 def _to_int_or_none(v):
-    if v is None: return None
-    try: return int(str(v).strip())
-    except Exception: return None
+    if v is None:
+        return None
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return None
 
 def parse_restart_time(server):
-    if not server.get("restart", False): return (None, None, None)
-    h = _to_int_or_none(server.get("restart_hour")); m = _to_int_or_none(server.get("restart_minute"))
-    if h is None or m is None: return (None, None, "missing")
-    if not (0 <= h <= 23) or not (0 <= m <= 59): return (None, None, "invalid")
-    return (h, m, None)
+    if not server.get("restart", False):
+        return None, None, None
+    h = _to_int_or_none(server.get("restart_hour"))
+    m = _to_int_or_none(server.get("restart_minute"))
+    if h is None or m is None:
+        return None, None, "missing"
+    if not (0 <= h <= 23) or not (0 <= m <= 59):
+        return None, None, "invalid"
+    return h, m, None
 
-# === Grouping & utils ===
-def get_display_group(server): return (server.get("group") or "").strip()
+# === Display/Grouping helpers ===
+def get_display_group(server):
+    g = (server.get("group") or "").strip()
+    return g  # "" if not set
+
 def get_merge_group_key(server):
     g = (server.get("group") or "").strip()
-    return g if g else f"__solo__:{server.get('ip')}:{server.get('port')}"
-def _truncate(text: str, limit: int) -> str: return text if len(text) <= limit else text[:limit-1] + "…"
-def _is_placeholder_webhook(url: str | None) -> bool: return (not url) or ("CHANGE_ME" in str(url))
-def _is_valid_discord_webhook(url: str | None) -> bool:
-    if not url: return False
-    try:
-        u = urllib.parse.urlparse(url)
-        return u.scheme == "https" and (u.hostname or "") in ALLOWED_WEBHOOK_HOSTS and (u.path or "").startswith("/api/webhooks/")
-    except Exception:
-        return False
+    if g:
+        return g
+    return f"__solo__:{server.get('ip')}:{server.get('port')}"
+
+# === Safety utilities ===
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+def _is_placeholder_webhook(url: str | None) -> bool:
+    return (not url) or ("CHANGE_ME" in str(url))
+
 def _safe_tz(tz: str):
-    try: return ZoneInfo(tz)
-    except Exception: return ZoneInfo("UTC")
+    try:
+        return ZoneInfo(tz)
+    except Exception:
+        return ZoneInfo("UTC")
+
 def _san(n: str) -> str:
-    for ch in ("`", "*", "_", "~", "|", ">", "@"): n = n.replace(ch, f"\\{ch}")
+    # escape simple markdown and trim very long names
+    for ch in ("`", "*", "_", "~", "|", ">"):
+        n = n.replace(ch, f"\\{ch}")
     return n[:64]
 
-# === Ping target resolution (PING FIX) ===
-def resolve_ping_target(server) -> tuple[str | None, dict]:
-    """
-    Returns (content_mention_str_or_none, allowed_mentions_dict).
-    Supports:
-      - server["ping_role_id"] (preferred for roles)
-      - server["ping_id"] with either <@123> (user) or <@&123> (role) or bare digits
-      - DEFAULT_USER_PING_ID fallback
-    """
-    rid = server.get("ping_role_id")
-    if rid:
-        rid_str = str(rid).strip()
-        return f"<@&{rid_str}>", {"users": [], "roles": [rid_str]}
-
-    raw = (server.get("ping_id") or DEFAULT_USER_PING_ID or "").strip()
-    if not raw:
-        return None, {"users": [], "roles": []}
-
-    m_role = re.fullmatch(r"<@&(\d+)>", raw)
-    if m_role:
-        rid = m_role.group(1)
-        return f"<@&{rid}>", {"users": [], "roles": [rid]}
-
-    m_user = re.fullmatch(r"<@!?(\d+)>", raw)
-    if m_user:
-        uid = m_user.group(1)
-        return f"<@{uid}>", {"users": [uid], "roles": []}
-
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if digits:
-        return f"<@{digits}>", {"users": [digits], "roles": []}
-
-    return None, {"users": [], "roles": []}
-
-# === Discord embed building ===
+# === Discord ===
 def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
     group_embeds = {}
     for group_name, pairs in grouped_servers.items():
         embeds = []
         for server, stats in pairs:
+            # Header (with optional Public/Passworded line)
             vis_enabled = bool(server.get("show_visibility", SHOW_VISIBILITY_BY_DEFAULT))
             vis_line = ""
             if vis_enabled and (stats.get("password_protected") is not None):
-                vis_line = ("\n🔐 Passworded" if bool(stats.get("password_protected")) else "\n🔓 Public")
+                if bool(stats.get("password_protected")):
+                    vis_line = "\n🔐 Passworded"
+                else:
+                    vis_line = "\n🔓 Public"
 
-            header = (f"**{stats['name']}**\n\n"
-                      f"📜 Map: `{stats['map']}`\n"
-                      f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line)
+            header = (
+                f"**{stats['name']}**\n\n"
+                f"📜 Map: `{stats['map']}`\n"
+                f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
+            )
 
+            # Optional restart block
             body_lines = []
             h, m, err = parse_restart_time(server)
             if server.get("restart", False):
@@ -453,13 +486,15 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     restart_ts = int(restart_utc.timestamp())
                     body_lines.append(f"🔄 Restarts daily at <t:{restart_ts}:t> _(your local time)_")
                 elif err == "missing":
-                    logger.warning("[WARN] Restart enabled but time not set for '%s'.", server.get("name","?"))
+                    logger.warning("[WARN] Restart enabled for '%s' but restart_hour/minute not set.", server.get("name","?"))
                     body_lines.append("⚠️ Restart time not configured — set restart_hour and restart_minute in servers.json")
                 else:
-                    logger.warning("[WARN] Invalid restart time for '%s'.", server.get("name","?"))
+                    logger.warning("[WARN] Restart time invalid for '%s'. Use hour 0–23 and minute 0–59.", server.get("name","?"))
                     body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
+
             body = ("\n\n" + "\n".join(body_lines)) if body_lines else ""
 
+            # Player list (toggleable; per-server override via "show_players": false)
             show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
             players_block = None
             if show_players:
@@ -467,41 +502,62 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     names = []
                     for n in stats["player_names"][: stats["max_players"]]:
                         names.append(f"- {_san(n)}")
-                        test_desc = (steam_banner or "") + header + body + "\n\n**Current Players:**\n" + "\n".join(names)
+                        test_desc = (
+                            (steam_banner or "")
+                            + header
+                            + body
+                            + "\n\n**Current Players:**\n"
+                            + "\n".join(names)
+                        )
                         if len(test_desc) > EMBED_DESC_LIMIT:
-                            names.pop(); names.append("…"); break
+                            names.pop()
+                            names.append("…")
+                            break
                     players_block = "\n".join(names)
                 else:
                     players_block = "*No players online*"
 
-            parts = []
+            # Build description with clean spacing
             banner = (steam_banner or "").strip()
-            if banner: parts.append(banner)
+            parts = []
+            if banner:
+                parts.append(banner)
             parts.append(header + body)
-            if show_players: parts.append("**Current Players:**\n" + players_block)
-            desc = _truncate("\n\n".join(parts), EMBED_DESC_LIMIT)
+            if show_players:
+                parts.append("**Current Players:**\n" + players_block)
+            desc = "\n\n".join(parts)
+            desc = _truncate(desc, EMBED_DESC_LIMIT)
 
             icon = server.get("icon_url") or server.get("emoji")
             title_text = f" {group_name} — {server['name']}" if group_name else f" {server['name']}"
+
             embed = {
                 "title": title_text,
                 "description": desc,
                 "color": 0x7F00FF,
                 "timestamp": datetime.utcnow().isoformat(),
-                "footer": {"text": "A2S v2.0.3 • Updated every 60s"},
+                "footer": {"text": "Updated every 60 seconds"},
             }
-            if server.get("ip") == "0.0.0.0": embed["color"] = 0xFFCC00
+
+            if server.get("ip") == "0.0.0.0":
+                embed["color"] = 0xFFCC00
+
             if icon:
                 if isinstance(icon, str) and icon.startswith("http"):
                     embed["thumbnail"] = {"url": icon}
                 else:
                     embed["title"] = f"{icon} {embed['title']}"
+
             embeds.append(embed)
 
+        # Cap to Discord's 10-embed limit per message
         if len(embeds) > GROUP_EMBED_LIMIT:
-            alert_issue("Embed limit exceeded", "Trimming to 10 embeds for this route.",
-                        {"group": group_name or "(no group)", "trimmed": len(embeds) - GROUP_EMBED_LIMIT},
-                        key=f"embedlimit:{group_name or 'nogroup'}")
+            alert_issue(
+                "Embed limit exceeded",
+                "Trimming to 10 embeds for this route to satisfy Discord limits.",
+                {"group": group_name or "(no group)", "trimmed": len(embeds) - GROUP_EMBED_LIMIT},
+                key=f"embedlimit:{group_name or 'nogroup'}"
+            )
             embeds = embeds[:GROUP_EMBED_LIMIT]
 
         group_embeds[group_name] = embeds
@@ -511,10 +567,16 @@ def send_initial_messages(grouped_embeds, group_webhooks):
     new_ids = {}
     for group, embeds in grouped_embeds.items():
         webhook = group_webhooks.get(group, DEFAULT_WEBHOOK_URL)
-        if _is_placeholder_webhook(webhook) or not _is_valid_discord_webhook(webhook):
-            alert_issue("No/invalid webhook for this route",
-                        "Route has no valid Discord webhook (or DEFAULT is placeholder).",
-                        {"group": group, "webhook": str(webhook)[:120]}, key=f"missing:init:{group}")
+        # If the DEFAULT webhook is a placeholder but users are intentionally using per-server webhooks,
+        # don't raise a global error — only skip when this *route* actually points at a placeholder.
+        if _is_placeholder_webhook(webhook):
+            # One-time, route-scoped notice so users know why nothing appears for this group
+            alert_issue(
+                "No webhook for this route",
+                "This route has no valid webhook (server webhook_url missing and DEFAULT_WEBHOOK_URL is a placeholder).",
+                {"group": group, "webhook": str(webhook)[:80]},
+                key=f"missing:init:{group}"
+            )
             continue
         resp, err = discord_request("POST", webhook + "?wait=true", json_payload={"embeds": embeds}, timeout=20)
         if resp and resp.status_code in (200, 204):
@@ -531,7 +593,8 @@ def send_initial_messages(grouped_embeds, group_webhooks):
     return new_ids
 
 def edit_discord_message(group, msg_id, embeds, webhook_url, rk):
-    if _is_placeholder_webhook(webhook_url) or not _is_valid_discord_webhook(webhook_url):
+    # If this points at a placeholder (e.g., DEFAULT is unused by design), treat as stale and drop quietly.
+    if _is_placeholder_webhook(webhook_url):
         if rk in message_ids:
             message_ids.pop(rk, None)
             save_json("message_ids.json", message_ids)
@@ -560,51 +623,30 @@ def edit_discord_message(group, msg_id, embeds, webhook_url, rk):
     alert_issue("Failed to update status message", "Discord rejected the edit message request.",
                 {"group": group, "webhook": webhook_url, "msg_id": msg_id, "error": errtxt}, key=f"edit:fail:{rk}")
 
-def delete_route_message(rk: str):
-    try:
-        if "|" not in rk: return
-        merge_key, webhook_url = rk.split("|", 1)
-        msg_id = message_ids.get(rk)
-        if not msg_id:
-            message_ids.pop(rk, None); save_json("message_ids.json", message_ids); return
-        if _is_placeholder_webhook(webhook_url) or not _is_valid_discord_webhook(webhook_url):
-            message_ids.pop(rk, None); save_json("message_ids.json", message_ids); return
-        resp, err = discord_request("DELETE", f"{webhook_url}/messages/{msg_id}", timeout=15)
-        message_ids.pop(rk, None); save_json("message_ids.json", message_ids)
-        if resp and resp.status_code in (200, 204, 404):
-            logger.info("[CLEANUP] Deleted route message for %s (status %s)", rk, getattr(resp, "status_code", "?"))
-            alert_resolve(f"post:init:{merge_key}|{webhook_url}"); alert_resolve(f"edit:fail:{rk}")
-        else:
-            errtxt = err or (f"{getattr(resp,'status_code','???')} - {getattr(resp,'text','')[:180]}")
-            logger.warning("[WARN] Cleanup delete for %s returned: %s", rk, errtxt)
-    except Exception as e:
-        logger.warning("[WARN] Exception during route message delete for %s: %s", rk, e)
-
 def post_ping(server):
-    """Post a down ping to the server's webhook (robust mention + allow-list)."""
-    # Safety: never ping for servers no longer in current config
-    try:
-        if not any((s.get('ip'), s.get('port')) == (server.get('ip'), server.get('port')) for s in servers):
-            logger.info("[PING] Skipping ping for removed server %s:%s", server.get('ip'), server.get('port'))
-            return None
-    except Exception:
-        pass
+    role_id = server.get("ping_role_id")
+    raw = None
+    allowed = {"users": [], "roles": []}
+    if role_id:
+        role_id_str = str(role_id).strip()
+        raw = f"<@&{role_id_str}>"
+        allowed["roles"] = [role_id_str]
+    else:
+        ping_id = server.get("ping_id", DEFAULT_USER_PING_ID)
+        if ping_id:
+            raw = ping_id
+            cleaned = "".join(ch for ch in ping_id if ch.isdigit())
+            if cleaned:
+                allowed["users"] = [cleaned]
 
-    mention, allowed = resolve_ping_target(server)
     webhook = server.get("webhook_url", DEFAULT_WEBHOOK_URL)
-    if _is_placeholder_webhook(webhook) or not _is_valid_discord_webhook(webhook):
-        alert_issue("Missing/invalid webhook for ping",
-                    "Down ping could not be delivered (no/invalid webhook).",
-                    {"server": server.get("name")},
-                    key=f"missing:ping:{server.get('name')}:{server.get('ip')}:{server.get('port')}")
+    if _is_placeholder_webhook(webhook):
+        alert_issue("Missing webhook for ping", "Server down ping could not be delivered (no webhook).",
+                    {"server": server.get("name")}, key=f"missing:ping:{server.get('name')}:{server.get('ip')}:{server.get('port')}")
         return None
-
-    content = (f"{mention} ⚠️ The `{server['name']}` server appears to be down!"
-               if mention else f"⚠️ The `{server['name']}` server appears to be down!")
+    content = (f"{raw} ⚠️ The `{server['name']}` server appears to be down!" if raw else
+               f"⚠️ The `{server['name']}` server appears to be down!")
     payload = {"content": content, "allowed_mentions": allowed}
-    logger.info("[PING] Posting ping for %s:%s (allowed=%s, content=%r)",
-                server.get("ip"), server.get("port"), allowed, content)
-
     resp, err = discord_request("POST", webhook + "?wait=true", json_payload=payload, timeout=20)
     if resp and resp.status_code in (200, 204):
         try:
@@ -618,143 +660,46 @@ def post_ping(server):
                 {"server": server.get("name"), "webhook": webhook, "error": errtxt}, key=f"ping:fail:{server.get('name')}|{webhook}")
     return None
 
-# === Config sanity ===
+# === Config sanity checks ===
 def validate_config(servers):
-    seen = {}; dups = []
+    seen = {}
+    dups = []
     for s in servers:
-        k = f"{s.get('ip')}:{s.get('port')}"; seen[k] = seen.get(k, 0) + 1
+        k = f"{s.get('ip')}:{s.get('port')}"
+        seen[k] = seen.get(k, 0) + 1
     for k, c in seen.items():
-        if c > 1: dups.append((k, c))
+        if c > 1:
+            dups.append((k, c))
     if dups:
         alert_issue("Duplicate servers in config", "Multiple entries share the same ip:port.",
                     {"duplicates": ", ".join([f"{k}×{c}" for k, c in dups])}, key="config:dups")
     for s in servers:
-        wh = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
-        if len((s.get("name") or "")) > 100: logger.warning("[WARN] Long server name (>100)")
-        if len((s.get("group") or "")) > 100: logger.warning("[WARN] Long group name (>100)")
-        if _is_placeholder_webhook(wh) or not _is_valid_discord_webhook(wh):
-            alert_issue("Invalid webhook in config", "A server has a missing/invalid Discord webhook.",
-                        {"server": s.get("name","?"), "webhook": str(wh)[:120]}, key=f"config:invalid_webhook:{s.get('name','?')}")
-
-# === Route computations ===
-def make_server_key(ip, port): return f"{ip}:{port}"
-def route_key(display_key, webhook): return f"{display_key}|{webhook}"
-def compute_expected_route_keys(servers):
-    expected = set()
+        nm = (s.get("name") or "")
+        gp = (s.get("group") or "")
+        if len(nm) > 100:
+            logger.warning("[WARN] Server name is very long (>100): %s…", nm[:100])
+        if len(gp) > 100:
+            logger.warning("[WARN] Group name is very long (>100): %s…", gp[:100])
+    groups = {}
     for s in servers:
-        expected.add(route_key(get_merge_group_key(s), s.get("webhook_url", DEFAULT_WEBHOOK_URL)))
-    return expected
+        key = (s.get("group") or "") + "|" + (s.get("webhook_url") or DEFAULT_WEBHOOK_URL)
+        groups[key] = groups.get(key, 0) + 1
+    for key, count in groups.items():
+        if count > GROUP_EMBED_LIMIT:
+            gname, wh = key.split("|", 1)
+            alert_issue("Group may exceed embed limit", "This group has more than 10 servers; trims will apply.",
+                        {"group": gname or "(no group)", "webhook": wh, "count": count}, key=f"config:group>{GROUP_EMBED_LIMIT}:{gname or 'nogroup'}")
 
-# --- BAK-assisted cleanup helpers + hot-reload helpers ---
-def load_previous_config_bak(path: str) -> list:
-    bak = f"{path}.bak"
-    if not os.path.exists(bak): return []
-    try:
-        with open(bak, "r", encoding="utf-8") as f:
-            data = json.load(f); return data if isinstance(data, list) else []
-    except Exception: return []
+# === Main helpers ===
+def make_server_key(ip, port):
+    return f"{ip}:{port}"
 
-def server_uid(s: dict) -> str: return f"{s.get('ip')}:{s.get('port')}"
-def route_of(server: dict) -> str:
-    return route_key(get_merge_group_key(server), server.get("webhook_url", DEFAULT_WEBHOOK_URL))
-def compute_expected_route_keys_from_list(servers_list: list) -> set:
-    exp = set()
-    for s in (servers_list or []): exp.add(route_of(s))
-    return exp
-
-def _clear_ping_for_uid(uid: str):
-    try:
-        if uid in ping_message_ids:
-            deleted = False
-            for rk in list(message_ids.keys()):
-                try: webhook_url = rk.split("|", 1)[1]
-                except Exception: continue
-                if _is_placeholder_webhook(webhook_url) or not _is_valid_discord_webhook(webhook_url): continue
-                try:
-                    discord_request("DELETE", f"{webhook_url}/messages/{ping_message_ids[uid]}", timeout=10)
-                    deleted = True; break
-                except Exception: pass
-            ping_message_ids.pop(uid, None); save_json("ping_message_ids.json", ping_message_ids)
-            if deleted: logger.info("[PING] Cleared lingering ping message for removed %s", uid)
-    except Exception as e:
-        logger.warning("[PING] Failed clearing ping for %s: %s", uid, e)
-
-def bak_compare_cleanup(previous_servers: list, current_servers: list):
-    """Delete messages for removed/moved routes and clear state for removed servers (no ping)."""
-    if NET_FREEZE_ACTIVE or _last_steam_unhealthy:
-        logger.info("[BAK] Skipping bak-compare cleanup (net-freeze or Steam unhealthy)."); return
-
-    prev_routes = compute_expected_route_keys_from_list(previous_servers)
-    curr_routes = compute_expected_route_keys_from_list(current_servers)
-    removed_routes = [rk for rk in prev_routes if rk not in curr_routes]
-    if removed_routes:
-        logger.info("[BAK] Deleting messages for %d routes removed since last config.", len(removed_routes))
-        for rk in removed_routes:
-            if rk in message_ids: delete_route_message(rk)
-
-    prev_uids = {server_uid(s) for s in previous_servers or []}
-    curr_uids = {server_uid(s) for s in current_servers or []}
-    removed_uids = prev_uids - curr_uids
-    if removed_uids:
-        for uid in removed_uids:
-            server_down.pop(uid, None)
-            has_pinged_down.pop(uid, None)
-            _clear_ping_for_uid(uid)
-        save_json("server_down.json", server_down)
-        save_json("has_pinged_down.json", has_pinged_down)
-        save_json("ping_message_ids.json", ping_message_ids)
-
-# Hot-reload helpers
-def _deepcopy_jsonable(obj):
-    try: return json.loads(json.dumps(obj))
-    except Exception: return obj
-
-def _rebuild_downtime_counter(existing_dc: dict, new_servers: list) -> dict:
-    """Keep counters for still-present servers; start at 0 for brand-new ones."""
-    new_dc = {}
-    for s in new_servers or []:
-        uid = f"{s.get('ip')}:{s.get('port')}"
-        new_dc[uid] = int(existing_dc.get(uid, 0))
-    return new_dc
-
-def _init_per_server_state(new_servers: list):
-    """Ensure state dicts have entries for new servers (idempotent)."""
-    changed = False
-    for s in new_servers or []:
-        uid = f"{s.get('ip')}:{s.get('port')}"
-        if uid not in server_down:
-            server_down[uid] = False; changed = True
-        if uid not in has_pinged_down:
-            has_pinged_down[uid] = False; changed = True
-    if changed:
-        save_json("server_down.json", server_down)
-        save_json("has_pinged_down.json", has_pinged_down)
-
-# Manual orphan cleanup
-def cleanup_orphans_file_once():
-    data = load_json(ORPHANS_FILE)
-    if not data: return
-    kept = []
-    if not isinstance(data, list):
-        logger.warning("[ORPHAN] %s is not a list; ignoring.", ORPHANS_FILE); return
-    for entry in data:
-        wh = (entry.get("webhook_url") or "").strip()
-        mid = str(entry.get("message_id") or "").strip()
-        if not wh or not mid or _is_placeholder_webhook(wh) or not _is_valid_discord_webhook(wh): continue
-        try:
-            resp, err = discord_request("DELETE", f"{wh}/messages/{mid}", timeout=15)
-            if resp and resp.status_code in (200, 204, 404):
-                logger.info("[ORPHAN] Deleted orphan message %s via webhook", mid)
-            else:
-                kept.append(entry)
-                logger.warning("[ORPHAN] Delete failed (%s). Keeping for retry.", getattr(resp, "status_code", err))
-        except Exception as e:
-            kept.append(entry); logger.warning("[ORPHAN] Exception deleting %s: %s", mid, e)
-    save_json(ORPHANS_FILE, kept)
+def route_key(display_key, webhook):
+    return f"{display_key}|{webhook}"
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.3 (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.2d (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -773,35 +718,17 @@ if __name__ == "__main__":
 
     servers, example_mode = load_servers_and_detect_example_mode()
     validate_config(servers)
-    cleanup_orphans_file_once()
 
-    # .bak compare at startup + refresh snapshot
-    prev_servers = load_previous_config_bak(CONFIG_FILE)
-    try:
-        if prev_servers: bak_compare_cleanup(prev_servers, servers)
-        else: logger.info("[BAK] No servers.json.bak found or unreadable; skipping bak compare.")
-    except Exception as e:
-        logger.warning("[BAK] Exception during bak compare: %s", e)
-    try:
-        save_json(f"{CONFIG_FILE}.bak", servers)
-        logger.info("[BAK] Snapshot refreshed -> %s.bak", CONFIG_FILE)
-    except Exception as e:
-        logger.warning("[BAK] Failed to refresh bak snapshot: %s", e)
-
-    # Track config changes
-    try: last_mtime = os.path.getmtime(CONFIG_FILE)
-    except Exception: last_mtime = None
-    prev_servers_snapshot = _deepcopy_jsonable(servers)
-
-    # Initialize per-server state & counters (in-memory)
+    # Initialize per-server state
     downtime_counter = {}
     for s in servers:
-        key = make_server_key(s["ip"], s["port"])
+        ip, port = s["ip"], s["port"]
+        key = make_server_key(ip, port)
         server_down.setdefault(key, False)
         has_pinged_down.setdefault(key, False)
         downtime_counter[key] = 0
 
-    # Steam health gate enable/disable
+    # Steam API key check → enable flag
     if STEAM_STATUS_CHECK_ENABLED:
         if (not STEAM_API_KEY) or (STEAM_API_KEY.strip() == "") or (STEAM_API_KEY == "PUT_YOUR_STEAM_WEB_API_KEY_HERE"):
             alert_issue("Steam API key missing", "Skipping Steam backend health checks until configured.",
@@ -811,46 +738,31 @@ if __name__ == "__main__":
             STEAM_HEALTH_ENABLED = True
     else:
         STEAM_HEALTH_ENABLED = False
-    logger.info("[Steam Health] %s", "Enabled" if STEAM_HEALTH_ENABLED else "Disabled")
+
+    if STEAM_HEALTH_ENABLED:
+        logger.info("[Steam Health] Enabled: Steam backend health checks are active.")
+    else:
+        logger.info("[Steam Health] Disabled: Steam backend health checks are skipped.")
+        if STEAM_STATUS_CHECK_ENABLED and ((not STEAM_API_KEY) or (STEAM_API_KEY.strip() == "") or (STEAM_API_KEY == "PUT_YOUR_STEAM_WEB_API_KEY_HERE")):
+            logger.info("[Steam Health] Reason: enabled=True but STEAM_API_KEY is missing; updates continue without gating.")
 
     # Main loop
     while True:
-        # --- CONFIG HOT-RELOAD (only if servers.json changed) ---
-        try: current_mtime = os.path.getmtime(CONFIG_FILE)
-        except Exception: current_mtime = last_mtime
-
-        if current_mtime != last_mtime:
-            logger.info("[CONFIG] Detected servers.json change -> reloading")
-            new_servers, example_mode = load_servers_and_detect_example_mode()
-            validate_config(new_servers)
-            try:
-                bak_compare_cleanup(prev_servers_snapshot, new_servers)
-            except Exception as e:
-                logger.warning("[BAK] Exception during bak compare on reload: %s", e)
-            try:
-                save_json(f"{CONFIG_FILE}.bak", new_servers)
-                logger.info("[BAK] Snapshot refreshed -> %s.bak", CONFIG_FILE)
-            except Exception as e:
-                logger.warning("[BAK] Failed to refresh bak snapshot: %s", e)
-            _init_per_server_state(new_servers)
-            downtime_counter = _rebuild_downtime_counter(downtime_counter, new_servers)
-            servers = new_servers
-            prev_servers_snapshot = _deepcopy_jsonable(new_servers)
-            last_mtime = current_mtime
-            logger.info("[CONFIG] Reloaded %d server(s).", len(servers))
-
         up_count = 0
         down_count = 0
 
-        # --- network health guard ---
+        # --- network health guard (net-freeze) ---
         if net_probe_ok():
             _net_ok_streak += 1; _net_fail_streak = 0
             if NET_FREEZE_ACTIVE and _net_ok_streak >= 2:
                 NET_FREEZE_ACTIVE = False
                 dur = None
-                try: dur = int(time.time() - (NET_OUTAGE_STARTED_AT or time.time()))
-                except Exception: pass
-                NET_OUTAGE_STARTED_AT = None; _save_net_state()
+                try:
+                    dur = int(time.time() - (NET_OUTAGE_STARTED_AT or time.time()))
+                except Exception:
+                    pass
+                NET_OUTAGE_STARTED_AT = None
+                _save_net_state()
                 alert_issue("Network outage recovered", f"Host connectivity restored after ~{dur}s.",
                             {"duration_s": dur}, key="net:outage:recovered")
                 alert_resolve("net:outage")
@@ -858,29 +770,34 @@ if __name__ == "__main__":
         else:
             _net_fail_streak += 1; _net_ok_streak = 0
             if not NET_FREEZE_ACTIVE and _net_fail_streak >= 3:
-                NET_FREEZE_ACTIVE = True; NET_OUTAGE_STARTED_AT = time.time(); _save_net_state()
+                NET_FREEZE_ACTIVE = True
+                NET_OUTAGE_STARTED_AT = time.time()
+                _save_net_state()
                 try:
                     with open("net_outages.jsonl", "a", encoding="utf-8") as f:
                         f.write(json.dumps({"started_at": NET_OUTAGE_STARTED_AT}) + "\n")
-                except Exception: pass
+                except Exception:
+                    pass
                 alert_issue("Network outage suspected",
                             "Host appears offline to Discord/DNS. Freezing counters, pings, and cleanup until connectivity recovers.",
                             {"fails": _net_fail_streak}, key="net:outage")
                 logger.info("[NET] Entered net-freeze: suppressing pings, freezing counters, skipping cleanup.")
 
-        # --- Steam health ---
+        # --- Optional Steam health gate ---
         prev_unhealthy = _last_steam_unhealthy
         steam_unhealthy = steam_is_unhealthy() if (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED) else False
         if not (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED):
             _last_steam_unhealthy = False
+
         if steam_unhealthy and not prev_unhealthy:
-            logger.info("[INFO] Entered Steam outage freeze: counters reset to 0 (non-down servers) & frozen until recovery.")
             for s in servers:
                 key = make_server_key(s["ip"], s["port"])
                 if not server_down.get(key, False):
                     downtime_counter[key] = 0
+            logger.info("[INFO] Entered Steam outage freeze: counters reset to 0 (non-down servers) & frozen until recovery.")
         if (not steam_unhealthy) and prev_unhealthy:
             logger.info("[INFO] Steam recovered: counters will resume normal increments.")
+
         steam_banner = build_steam_banner(steam_unhealthy, _last_steam_check, _last_steam_snapshot)
 
         # --- Build routes and gather stats ---
@@ -902,7 +819,7 @@ if __name__ == "__main__":
                 up_count += 1
                 logger.info("[%s] %s is up: %s on %s", datetime.now(), name, stats['players'], stats['map'])
 
-                # Recover logic: clear down flags and delete any lingering ping
+                # Recover logic
                 if server_down.get(key, False):
                     server_down[key] = False
                     downtime_counter[key] = 0
@@ -910,7 +827,7 @@ if __name__ == "__main__":
                     if key in ping_message_ids:
                         try:
                             delete_ping_url = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
-                            if delete_ping_url and not _is_placeholder_webhook(delete_ping_url) and _is_valid_discord_webhook(delete_ping_url):
+                            if delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
                                 discord_request("DELETE", f"{delete_ping_url}/messages/{ping_message_ids[key]}", timeout=10)
                         except Exception:
                             pass
@@ -926,95 +843,68 @@ if __name__ == "__main__":
                 if example_mode:
                     continue
                 if steam_unhealthy or NET_FREEZE_ACTIVE:
-                    # Freeze counters during global issues
+                    downtime_counter[key] = 0
                     continue
-
-                # Increment consecutive-failure counter
-                prev_cnt = int(downtime_counter.get(key, 0))
-                cur = prev_cnt + 1
+                prev = downtime_counter.get(key, 0)
+                cur = prev + 1
                 downtime_counter[key] = cur
-
-                # Mark as down once threshold reached (idempotent)
-                if cur >= DOWN_FAIL_THRESHOLD and not server_down.get(key, False):
-                    server_down[key] = True
-                    save_json("server_down.json", server_down)
-
-                # Send a single ping exactly when we cross the threshold
-                if (cur == DOWN_FAIL_THRESHOLD) and not has_pinged_down.get(key, False):
-                    pid = post_ping(s)
-                    if pid:
-                        ping_message_ids[key] = pid
-                        save_json("ping_message_ids.json", ping_message_ids)
-                    has_pinged_down[key] = True
-                    save_json("has_pinged_down.json", has_pinged_down)
+                if cur >= DOWN_FAIL_THRESHOLD:
+                    if not server_down.get(key, False):
+                        server_down[key] = True
+                    if not has_pinged_down.get(key, False):
+                        has_pinged_down[key] = True
+                        if key not in ping_message_ids:
+                            pid = post_ping(s)
+                            if pid:
+                                ping_message_ids[key] = pid
+                                save_json("ping_message_ids.json", ping_message_ids)
 
         logger.info("[CYCLE] Up: %s  Down: %s  Routes: %s", up_count, down_count, len(grouped_routes))
 
-        # --- Route message deletion for removed/empty routes ---
-        if (not NET_FREEZE_ACTIVE) and (not _last_steam_unhealthy):
-            try:
-                stored_routes = set(message_ids.keys())
-
-                if CLEANUP_REMOVED_ROUTES:
-                    expected_route_keys = compute_expected_route_keys(servers)
-                    removed_routes = [rk for rk in stored_routes if rk not in expected_route_keys]
-                    if removed_routes:
-                        logger.info("[CLEANUP] Deleting messages for %d removed routes", len(removed_routes))
-                        for rk in removed_routes:
-                            delete_route_message(rk)
-                        stored_routes = set(message_ids.keys())
-
-                if DELETE_ON_EMPTY_ROUTES:
-                    current_active_routes = set(grouped_routes.keys())
-                    empty_routes = [rk for rk in stored_routes if rk not in current_active_routes]
-                    if empty_routes:
-                        logger.info("[CLEANUP] Deleting messages for %d empty routes (no up servers)", len(empty_routes))
-                        for rk in empty_routes:
-                            delete_route_message(rk)
-            except Exception as e:
-                logger.warning("[WARN] Failed route cleanup: %s", e)
-
-        # --- Optional stale-id cleanup ---
-        if STALE_PURGE_ENABLED and (not NET_FREEZE_ACTIVE):
-            try:
-                stale_guard = load_json("stale_guard.json")
-            except Exception:
-                stale_guard = {}
-            empty_cycles = int(stale_guard.get("empty_cycles", 0))
-            if len(grouped_routes) == 0:
-                empty_cycles += 1
+        # --- Stale message_ids cleanup guard (optional) ---
+        if STALE_PURGE_ENABLED:
+            if NET_FREEZE_ACTIVE:
+                logger.info("[CLEANUP] Skipped (net-freeze active).")
             else:
-                empty_cycles = 0
-            stale_guard["empty_cycles"] = empty_cycles
-            save_json("stale_guard.json", stale_guard)
+                try:
+                    stale_guard = load_json("stale_guard.json")
+                except Exception:
+                    stale_guard = {}
+                empty_cycles = int(stale_guard.get("empty_cycles", 0))
+                if len(grouped_routes) == 0:
+                    empty_cycles += 1
+                else:
+                    empty_cycles = 0
+                stale_guard["empty_cycles"] = empty_cycles
+                save_json("stale_guard.json", stale_guard)
 
-            expected_route_keys = compute_expected_route_keys(servers)
-            do_cleanup = (len(grouped_routes) > 0) or (empty_cycles >= 10)
-            if do_cleanup:
-                active_route_keys = set(grouped_routes.keys())
-                protected_keys = active_route_keys.union(expected_route_keys)
-                stale = [rk for rk in list(message_ids.keys()) if rk not in protected_keys]
-                if stale:
-                    logger.info("[INFO] Removing stale message IDs: %s", stale)
-                    for rk in stale:
-                        message_ids.pop(rk, None)
-                    save_json("message_ids.json", message_ids)
+                expected_route_keys = set()
+                for s in servers:
+                    expected_hook = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+                    merge_key = get_merge_group_key(s)
+                    rk_expected = route_key(merge_key, expected_hook)
+                    expected_route_keys.add(rk_expected)
 
-        # --- Invalid route cache cleanup (placeholder/invalid webhooks) ---
-        _invalid_routes = [
-            rk for rk in list(message_ids.keys())
-            if ("|" in rk and (
-                _is_placeholder_webhook(rk.split("|", 1)[1]) or
-                not _is_valid_discord_webhook(rk.split("|", 1)[1])
-            ))
-        ]
+                do_cleanup = (len(grouped_routes) > 0) or (empty_cycles >= 10)
+                if do_cleanup:
+                    active_route_keys = set(grouped_routes.keys())
+                    protected_keys = active_route_keys.union(expected_route_keys)
+                    stale = [rk for rk in list(message_ids.keys()) if rk not in protected_keys]
+                    if stale:
+                        logger.info("[INFO] Removing stale message IDs: %s", stale)
+                        for rk in stale:
+                            message_ids.pop(rk, None)
+                        save_json("message_ids.json", message_ids)
+
+        # --- Build and send/edit embeds per route ---
+        # Always purge obviously invalid stored routes that point to placeholder DEFAULT webhook
+        _invalid_routes = [rk for rk in list(message_ids.keys()) if ("|" in rk and _is_placeholder_webhook(rk.split("|",1)[1]))]
         if _invalid_routes:
-            logger.info("[CLEANUP] Dropping invalid-webhook routes from message_ids: %s", _invalid_routes)
+            logger.info("[CLEANUP] Dropping placeholder-webhook routes from message_ids: %s", _invalid_routes)
             for rk in _invalid_routes:
                 message_ids.pop(rk, None)
             save_json("message_ids.json", message_ids)
 
-        # --- Build & send/edit embeds ---
         if grouped_routes:
             for rk, pairs in grouped_routes.items():
                 merge_key, webhook_url = rk.split("|", 1)
@@ -1023,15 +913,18 @@ if __name__ == "__main__":
                 if rk in message_ids:
                     edit_discord_message(display_label, message_ids[rk], embeds, webhook_url, rk)
                 else:
-                    if _is_placeholder_webhook(webhook_url) or not _is_valid_discord_webhook(webhook_url):
-                        alert_issue("Default webhook not set/invalid", "Cannot create status message.",
-                                    {"group": display_label or "(no group)", "webhook": str(webhook_url)[:120]},
-                                    key=f"missing:init:{display_label}")
+                    if _is_placeholder_webhook(webhook_url):
+                        alert_issue("Default webhook not set", "Cannot create status message: webhook is placeholder or empty.",
+                                    {"group": display_label or "(no group)", "webhook": str(webhook_url)[:80]}, key=f"missing:init:{display_label}")
                         continue
                     new_ids = send_initial_messages({display_label: embeds}, {display_label: webhook_url})
                     if display_label in new_ids:
                         message_ids[rk] = new_ids[display_label]
                         save_json("message_ids.json", message_ids)
                         alert_resolve(f"post:init:{display_label}|{webhook_url}")
+
+        # Persist state each loop
+        save_json("server_down.json", server_down)
+        save_json("has_pinged_down.json", has_pinged_down)
 
         time.sleep(INTERVAL_SECONDS)
