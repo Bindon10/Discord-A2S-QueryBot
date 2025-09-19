@@ -6,7 +6,7 @@
 - Added `SHOW_QUERIED_NAME_IN_HEADER` toggle in config
 - Added support for `webhooks[]` array (servers can post to multiple webhooks)
 - Grouped embeds now include subtle dividers between servers for readability
-
+- I broke server Emojis, sorry. I'll fix it later.
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -14,7 +14,7 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 ---
 ## 📸 Example Screenshot
 
-![alt text](https://i.imgur.com/b14Bp1o.png)
+![alt text](https://i.imgur.com/79QDD7A.png)
 
 ---
 
