@@ -15,6 +15,7 @@ No plugins, RCON, or server mods required — it talks to your game servers the 
 ## 📸 Example Screenshot
 
 ![alt text](https://i.imgur.com/79QDD7A.png)
+![alt text](https://i.imgur.com/qNubzov.png)
 
 ---
 
