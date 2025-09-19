@@ -1,4 +1,17 @@
-# Discord-A2S-QueryBot v2.0.2d — Passworded server query + Debug Logging (untested)
+# ============================================================
+# Discord-A2S-QueryBot
+# Version: v2.0.3
+#
+# CHANGELOG
+# v2.0.3 (2025-09-18)
+# - Added SHOW_QUERIED_NAME_IN_HEADER toggle + failsafe in config
+# - Consolidated grouped embeds (one embed per group)
+# - Added subtle dividers between servers in grouped embeds
+# - Multi-webhook support (webhooks[] and webhook_url)
+# - Independent message_id per webhook (no overwrites)
+# - Quiet logging unless warnings/errors
+# ============================================================
+
 
 import a2s
 import requests
@@ -55,6 +68,13 @@ STALE_PURGE_ENABLED = False    # if True, purge message_ids for routes no longer
 SHOW_PLAYERS_BY_DEFAULT = True # default: show player list in embeds (override per-server with 'show_players')
 SHOW_VISIBILITY_BY_DEFAULT = False # default: show visibility line (Public/Passworded) per server; override with 'show_visibility'
 
+# Failsafe: make sure SHOW_QUERIED_NAME_IN_HEADER is always defined
+try:
+    SHOW_QUERIED_NAME_IN_HEADER
+except NameError:
+    SHOW_QUERIED_NAME_IN_HEADER = False
+
+
 # === INTERNAL (you usually don't need to touch below this line) ===
 
 # Debug logging setup: console always ON (INFO+); optional rotating file for DEBUG
@@ -80,7 +100,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.2d"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.3"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -152,6 +172,7 @@ ping_message_ids = load_json("ping_message_ids.json")
 server_down = load_json("server_down.json")
 has_pinged_down = load_json("has_pinged_down.json")
 alerts_state = load_json("alerts_state.json")
+ping_routes = load_json("ping_routes.json")
 
 # Net-freeze (host network outage)
 NET_FREEZE_ACTIVE = False
@@ -454,103 +475,177 @@ def _san(n: str) -> str:
         n = n.replace(ch, f"\\{ch}")
     return n[:64]
 
+
+
+def delete_discord_message(msg_id: int | str, webhook_url: str, label: str = "unknown") -> bool:
+    """Best-effort delete of a Discord message by id."""
+    if not webhook_url or _is_placeholder_webhook(webhook_url):
+        return False
+    try:
+        resp, err = discord_request("DELETE", f"{webhook_url}/messages/{msg_id}", timeout=10)
+        if resp and resp.status_code in (200, 204):
+            logger.info("[CLEANUP] Deleted message %s (%s)", msg_id, label)
+            return True
+        if resp and resp.status_code == 404:
+            logger.info("[CLEANUP] Message %s already gone (%s)", msg_id, label)
+            return True
+        errtxt = err or (f"{getattr(resp,'status_code','???')} - {getattr(resp,'text','')[:180]}")
+        logger.warning("[WARN] Failed to delete message %s (%s): %s", msg_id, label, errtxt)
+    except Exception as e:
+        logger.warning("[WARN] Exception deleting message %s (%s): %s", msg_id, label, e)
+    return False
 # === Discord ===
+
 def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
     group_embeds = {}
     for group_name, pairs in grouped_servers.items():
         embeds = []
-        for server, stats in pairs:
-            # Header (with optional Public/Passworded line)
-            vis_enabled = bool(server.get("show_visibility", SHOW_VISIBILITY_BY_DEFAULT))
-            vis_line = ""
-            if vis_enabled and (stats.get("password_protected") is not None):
-                if bool(stats.get("password_protected")):
-                    vis_line = "\n🔐 Passworded"
+        if group_name:
+            # Consolidate all servers in this group into one embed
+            sections = []
+            for idx, (server, stats) in enumerate(pairs):
+                vis_enabled = bool(server.get("show_visibility", SHOW_VISIBILITY_BY_DEFAULT))
+                vis_line = ""
+                if vis_enabled and (stats.get("password_protected") is not None):
+                    if bool(stats.get("password_protected")):
+                        vis_line = "\n🔐 Passworded"
+                    else:
+                        vis_line = "\n🔓 Public"
+
+                display_name = stats.get('queried_name') if SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name') else server['name']
+                header = f"**{display_name}**\n\n"
+                header += (
+                    f"📜 Map: `{stats['map']}`\n"
+                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
+                )
+
+                body_lines = []
+                h, m, err = parse_restart_time(server)
+                if server.get("restart", False):
+                    if err is None:
+                        tz = _safe_tz(server.get("timezone", "UTC"))
+                        local_restart = datetime.now(tz).replace(hour=h, minute=m, second=0, microsecond=0)
+                        restart_utc = local_restart.astimezone(ZoneInfo("UTC"))
+                        restart_ts = int(restart_utc.timestamp())
+                        body_lines.append(f"🔄 Restarts daily at <t:{restart_ts}:t> _(your local time)_")
+                    elif err == "missing":
+                        logger.warning("[WARN] Restart enabled in config for '%s' but restart_hour/minute not set.", server.get("name","?"))
+                        body_lines.append("⚠️ Restart time not configured — set restart_hour and restart_minute in servers.json")
+                    else:
+                        logger.warning("[WARN] Restart time invalid in config for '%s'. Use hour 0–23 and minute 0–59.", server.get("name","?"))
+                        body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
+
+                show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
+                players_block = ""
+                if stats.get("players", 0) > 0 and stats.get("player_names"):
+                    players_block = "\n".join(f"- {_san(p)}" for p in stats["player_names"][:PLAYER_LIST_LIMIT])
+                    if len(stats["player_names"]) > PLAYER_LIST_LIMIT:
+                        players_block += "\n…"
                 else:
-                    vis_line = "\n🔓 Public"
+                    players_block = "No players online"
 
-            header = (
-                f"**{stats['name']}**\n\n"
-                f"📜 Map: `{stats['map']}`\n"
-                f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
-            )
+                parts = [header]
+                if body_lines:
+                    parts.append("\n".join(body_lines))
+                if show_players:
+                    parts.append("**Current Players:**\n" + players_block)
+                section_desc = "\n\n".join(parts)
+                section_desc = _truncate(section_desc, EMBED_DESC_LIMIT)
 
-            # Optional restart block
-            body_lines = []
-            h, m, err = parse_restart_time(server)
-            if server.get("restart", False):
-                if err is None:
-                    tz = _safe_tz(server.get("timezone", "UTC"))
-                    local_restart = datetime.now(tz).replace(hour=h, minute=m, second=0, microsecond=0)
-                    restart_utc = local_restart.astimezone(ZoneInfo("UTC"))
-                    restart_ts = int(restart_utc.timestamp())
-                    body_lines.append(f"🔄 Restarts daily at <t:{restart_ts}:t> _(your local time)_")
-                elif err == "missing":
-                    logger.warning("[WARN] Restart enabled for '%s' but restart_hour/minute not set.", server.get("name","?"))
-                    body_lines.append("⚠️ Restart time not configured — set restart_hour and restart_minute in servers.json")
-                else:
-                    logger.warning("[WARN] Restart time invalid for '%s'. Use hour 0–23 and minute 0–59.", server.get("name","?"))
-                    body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
+                # Add subtle divider except after the last server
+                if idx < len(pairs) - 1:
+                    section_desc += "\n────────────"
 
-            body = ("\n\n" + "\n".join(body_lines)) if body_lines else ""
+                sections.append(section_desc)
 
-            # Player list (toggleable; per-server override via "show_players": false)
-            show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
-            players_block = None
-            if show_players:
-                if stats["player_names"]:
-                    names = []
-                    for n in stats["player_names"][: stats["max_players"]]:
-                        names.append(f"- {_san(n)}")
-                        test_desc = (
-                            (steam_banner or "")
-                            + header
-                            + body
-                            + "\n\n**Current Players:**\n"
-                            + "\n".join(names)
-                        )
-                        if len(test_desc) > EMBED_DESC_LIMIT:
-                            names.pop()
-                            names.append("…")
-                            break
-                    players_block = "\n".join(names)
-                else:
-                    players_block = "*No players online*"
-
-            # Build description with clean spacing
-            banner = (steam_banner or "").strip()
-            parts = []
-            if banner:
-                parts.append(banner)
-            parts.append(header + body)
-            if show_players:
-                parts.append("**Current Players:**\n" + players_block)
-            desc = "\n\n".join(parts)
-            desc = _truncate(desc, EMBED_DESC_LIMIT)
-
-            icon = server.get("icon_url") or server.get("emoji")
-            title_text = f" {group_name} — {server['name']}" if group_name else f" {server['name']}"
+            combined_desc = "\n\n".join(sections)
+            combined_desc = _truncate(combined_desc, EMBED_DESC_LIMIT)
 
             embed = {
-                "title": title_text,
-                "description": desc,
+                "title": group_name,
+                "description": combined_desc,
                 "color": 0x7F00FF,
                 "timestamp": datetime.utcnow().isoformat(),
                 "footer": {"text": "Updated every 60 seconds"},
             }
-
-            if server.get("ip") == "0.0.0.0":
-                embed["color"] = 0xFFCC00
-
-            if icon:
-                if isinstance(icon, str) and icon.startswith("http"):
-                    embed["thumbnail"] = {"url": icon}
-                else:
-                    embed["title"] = f"{icon} {embed['title']}"
+            if steam_banner:
+                embed["image"] = {"url": steam_banner}
 
             embeds.append(embed)
+        else:
+            # Not grouped: one embed per server
+            for server, stats in pairs:
+                vis_enabled = bool(server.get("show_visibility", SHOW_VISIBILITY_BY_DEFAULT))
+                vis_line = ""
+                if vis_enabled and (stats.get("password_protected") is not None):
+                    if bool(stats.get("password_protected")):
+                        vis_line = "\n🔐 Passworded"
+                    else:
+                        vis_line = "\n🔓 Public"
 
-        # Cap to Discord's 10-embed limit per message
+                header = ""
+                if SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name'):
+                    header = f"**{stats['queried_name']}**\n\n"
+                header += (
+                    f"📜 Map: `{stats['map']}`\n"
+                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
+                )
+
+                body_lines = []
+                h, m, err = parse_restart_time(server)
+                if server.get("restart", False):
+                    if err is None:
+                        tz = _safe_tz(server.get("timezone", "UTC"))
+                        local_restart = datetime.now(tz).replace(hour=h, minute=m, second=0, microsecond=0)
+                        restart_utc = local_restart.astimezone(ZoneInfo("UTC"))
+                        restart_ts = int(restart_utc.timestamp())
+                        body_lines.append(f"🔄 Restarts daily at <t:{restart_ts}:t> _(your local time)_")
+                    elif err == "missing":
+                        logger.warning("[WARN] Restart enabled in config for '%s' but restart_hour/minute not set.", server.get("name","?"))
+                        body_lines.append("⚠️ Restart time not configured — set restart_hour and restart_minute in servers.json")
+                    else:
+                        logger.warning("[WARN] Restart time invalid in config for '%s'. Use hour 0–23 and minute 0–59.", server.get("name","?"))
+                        body_lines.append("⚠️ Restart time invalid — use hour 0–23 and minute 0–59")
+
+                show_players = bool(server.get("show_players", SHOW_PLAYERS_BY_DEFAULT))
+                players_block = ""
+                if stats.get("players", 0) > 0 and stats.get("player_names"):
+                    players_block = "\n".join(f"- {_san(p)}" for p in stats["player_names"][:PLAYER_LIST_LIMIT])
+                    if len(stats["player_names"]) > PLAYER_LIST_LIMIT:
+                        players_block += "\n…"
+                else:
+                    players_block = "No players online"
+
+                parts = [header]
+                if body_lines:
+                    parts.append("\n".join(body_lines))
+                if show_players:
+                    parts.append("**Current Players:**\n" + players_block)
+                desc = "\n\n".join(parts)
+                desc = _truncate(desc, EMBED_DESC_LIMIT)
+
+                icon = server.get("icon_url") or server.get("emoji")
+                title_text = (server['name'] if not (SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name')) else stats['queried_name'])
+
+                embed = {
+                    "title": title_text,
+                    "description": desc,
+                    "color": 0x7F00FF,
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "footer": {"text": "Updated every 60 seconds"},
+                }
+
+                if server.get("ip") == "0.0.0.0":
+                    embed["color"] = 0xFFCC00
+
+                if icon:
+                    if isinstance(icon, str) and str(icon).startswith("http"):
+                        embed["thumbnail"] = {"url": icon}
+                    else:
+                        embed["title"] = f"{icon} {embed['title']}"
+
+                embeds.append(embed)
+
         if len(embeds) > GROUP_EMBED_LIMIT:
             alert_issue(
                 "Embed limit exceeded",
@@ -562,6 +657,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
 
         group_embeds[group_name] = embeds
     return group_embeds
+
 
 def send_initial_messages(grouped_embeds, group_webhooks):
     new_ids = {}
@@ -699,7 +795,7 @@ def route_key(display_key, webhook):
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.2d (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.3 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -748,6 +844,49 @@ if __name__ == "__main__":
 
     # Main loop
     while True:
+
+        # Hot reload servers.json each cycle
+        servers, example_mode = load_servers_and_detect_example_mode()
+
+        # Reconcile state dicts vs current servers.json
+
+        # Reconcile route keys (handles group/webhook changes)
+        expected_route_keys = set()
+        for s in servers:
+            hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
+            merge_key = get_merge_group_key(s)
+            for wh in hooks:
+                expected_route_keys.add(route_key(merge_key, wh))
+
+        stale_routes = [rk for rk in list(message_ids.keys()) if rk not in expected_route_keys]
+        if stale_routes:
+            logger.info("[CLEANUP] Routes changed or removed: %s", stale_routes)
+            for rk in stale_routes:
+                msg_id = message_ids.pop(rk, None)
+                try:
+                    merge_key, wh = rk.split("|", 1)
+                except ValueError:
+                    wh = DEFAULT_WEBHOOK_URL
+                if msg_id:
+                    delete_discord_message(msg_id, wh, label=f"stale/changed route {rk}")
+            save_json("message_ids.json", message_ids)
+        active_keys = {f"{s['ip']}:{s['port']}" for s in servers}
+        for key in list(server_down.keys()):
+            if key not in active_keys:
+                server_down.pop(key, None)
+                has_pinged_down.pop(key, None)
+        for key in list(downtime_counter.keys()):
+            if key not in active_keys:
+                downtime_counter.pop(key, None)
+        removed_with_pings = [k for k in list(ping_message_ids.keys()) if k not in active_keys]
+        for key in removed_with_pings:
+            msg_id = ping_message_ids.pop(key, None)
+            webhook = ping_routes.pop(key, DEFAULT_WEBHOOK_URL)
+            if msg_id:
+                delete_discord_message(msg_id, webhook, label=f"removed-server ping {key}")
+        if removed_with_pings:
+            save_json("ping_message_ids.json", ping_message_ids)
+            save_json("ping_routes.json", ping_routes)
         up_count = 0
         down_count = 0
 
@@ -810,11 +949,11 @@ if __name__ == "__main__":
 
             stats = fetch_stats(ip, port)
             if stats:
-                server_hook = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
-                merge_key = get_merge_group_key(s)
-                rk = route_key(merge_key, server_hook)
-
-                grouped_routes.setdefault(rk, []).append((s, stats))
+                hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
+                for server_hook in hooks:
+                    merge_key = get_merge_group_key(s)
+                    rk = route_key(merge_key, server_hook)
+                    grouped_routes.setdefault(rk, []).append((s, stats))
 
                 up_count += 1
                 logger.info("[%s] %s is up: %s on %s", datetime.now(), name, stats['players'], stats['map'])
@@ -857,7 +996,9 @@ if __name__ == "__main__":
                             pid = post_ping(s)
                             if pid:
                                 ping_message_ids[key] = pid
+                                ping_routes[key] = webhook
                                 save_json("ping_message_ids.json", ping_message_ids)
+                                save_json("ping_routes.json", ping_routes)
 
         logger.info("[CYCLE] Up: %s  Down: %s  Routes: %s", up_count, down_count, len(grouped_routes))
 
@@ -880,10 +1021,11 @@ if __name__ == "__main__":
 
                 expected_route_keys = set()
                 for s in servers:
-                    expected_hook = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+                    hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
                     merge_key = get_merge_group_key(s)
-                    rk_expected = route_key(merge_key, expected_hook)
-                    expected_route_keys.add(rk_expected)
+                    for expected_hook in hooks:
+                        rk_expected = route_key(merge_key, expected_hook)
+                        expected_route_keys.add(rk_expected)
 
                 do_cleanup = (len(grouped_routes) > 0) or (empty_cycles >= 10)
                 if do_cleanup:
@@ -891,8 +1033,15 @@ if __name__ == "__main__":
                     protected_keys = active_route_keys.union(expected_route_keys)
                     stale = [rk for rk in list(message_ids.keys()) if rk not in protected_keys]
                     if stale:
-                        logger.info("[INFO] Removing stale message IDs: %s", stale)
+                        logger.info("[INFO] Purging stale routes: %s", stale)
                         for rk in stale:
+                            msg_id = message_ids.get(rk)
+                            try:
+                                merge_key, webhook_url = rk.split("|", 1)
+                            except ValueError:
+                                webhook_url = DEFAULT_WEBHOOK_URL
+                            if msg_id:
+                                delete_discord_message(msg_id, webhook_url, label=f"stale route {rk}")
                             message_ids.pop(rk, None)
                         save_json("message_ids.json", message_ids)
 

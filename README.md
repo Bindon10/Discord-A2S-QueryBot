@@ -1,5 +1,13 @@
 # Discord-A2S-QueryBot (v2.0.3)
 
+## Changelog
+
+### v2.0.3 (2025-09-18)
+- Added `SHOW_QUERIED_NAME_IN_HEADER` toggle in config
+- Added support for `webhooks[]` array (servers can post to multiple webhooks)
+- Grouped embeds now include subtle dividers between servers for readability
+
+
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
 
@@ -97,7 +105,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 ```json
 [
   {
-    "name": "Mirage EU 1",
+    "name": "EU 1",
     "ip": "123.45.67.89",
     "port": 27016,
     "group": "Mirage: Arcane Warfare",
@@ -110,13 +118,25 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
   {
-    "name": "Chivalry NA",
+    "name": "NA 1",
     "ip": "123.45.67.90",
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
     "restart": false,
     "emoji": "⚔️",
     "webhook_url": "https://discord.com/api/webhooks/.../..."
+  },
+  {
+    "name": "NA 2",
+    "ip": "123.45.67.90",
+    "port": 27015,
+    "group": "Chivalry: Medieval Warfare",
+    "restart": false,
+    "emoji": "⚔️",
+    "webhooks": [
+		"https://discord.com/api/webhooks/.../...",
+		"https://discord.com/api/webhooks/.../..."
+	]
   }
 ]
 ```
