@@ -569,7 +569,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 "footer": {"text": "Updated every 60 seconds"},
             }
             if steam_banner:
-                embed["image"] = {"url": steam_banner}
+                embed["description"] = steam_banner + "\n" + embed.get("description", "")
 
             embeds.append(embed)
         else:
@@ -689,6 +689,11 @@ def send_initial_messages(grouped_embeds, group_webhooks):
     return new_ids
 
 def edit_discord_message(group, msg_id, embeds, webhook_url, rk):
+    # Safeguard against empty or malformed embeds
+    if not embeds or not any(e.get("description") or e.get("title") for e in embeds):
+        logger.warning("[WARN] Skipping update for %s — empty embed payload", group)
+        return
+
     # If this points at a placeholder (e.g., DEFAULT is unused by design), treat as stale and drop quietly.
     if _is_placeholder_webhook(webhook_url):
         if rk in message_ids:
