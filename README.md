@@ -6,7 +6,7 @@
 - Added `SHOW_QUERIED_NAME_IN_HEADER` toggle in config
 - Added support for `webhooks[]` array (servers can post to multiple webhooks)
 - Grouped embeds now include subtle dividers between servers for readability
-- I broke server Emojis, sorry. I'll fix it later.
+- I broke server Emojis, sorry. Just add it manually to the name or the group values in your servers.json.
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -94,7 +94,6 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `restart_hour` | ❌ | string/number | Hour `0–23`. Accepts `"04"`, `"4"`, `4`. |
 | `restart_minute` | ❌ | string/number | Minute `0–59`. Accepts `"09"`, `9`, `0`. |
 | `timezone` | ❌ | string | IANA TZ (e.g. `"America/Edmonton"`). Falls back to UTC if invalid. |
-| `emoji` | ❌ | string | Emoji to decorate the title (e.g., `"⚔️"`). |
 | `icon_url` | ❌ | string | Thumbnail URL (overrides emoji). |
 | `webhook_url` | ❌ | string | Per-server webhook override. |
 | `ping_id` | ❌ | string | Per-server user mention for down pings (e.g., `<@123...>`). |
@@ -114,7 +113,6 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "restart_hour": "04",
     "restart_minute": "30",
     "timezone": "America/Edmonton",
-    "emoji": "🧙",
     "ping_role_id": "123456789012345678",
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
@@ -124,7 +122,6 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
     "restart": false,
-    "emoji": "⚔️",
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
   {
@@ -133,7 +130,6 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
     "restart": false,
-    "emoji": "⚔️",
     "webhooks": [
 		"https://discord.com/api/webhooks/.../...",
 		"https://discord.com/api/webhooks/.../..."
