@@ -1001,7 +1001,8 @@ if __name__ == "__main__":
                             pid = post_ping(s)
                             if pid:
                                 ping_message_ids[key] = pid
-                                ping_routes[key] = webhook
+                                webhook_url = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+                                ping_routes[key] = webhook_url
                                 save_json("ping_message_ids.json", ping_message_ids)
                                 save_json("ping_routes.json", ping_routes)
 
