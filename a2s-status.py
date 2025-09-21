@@ -67,6 +67,7 @@ EMBED_DESC_LIMIT    = 4096     # Discord hard cap per embed description
 STALE_PURGE_ENABLED = False    # if True, purge message_ids for routes no longer present in config
 SHOW_PLAYERS_BY_DEFAULT = True # default: show player list in embeds (override per-server with 'show_players')
 SHOW_VISIBILITY_BY_DEFAULT = False # default: show visibility line (Public/Passworded) per server; override with 'show_visibility'
+PLAYER_LIST_LIMIT   = 20       # max number of player names to show in embeds
 
 # Failsafe: make sure SHOW_QUERIED_NAME_IN_HEADER is always defined
 try:
