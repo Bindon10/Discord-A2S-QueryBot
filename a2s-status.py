@@ -1,15 +1,15 @@
 # ============================================================
 # Discord-A2S-QueryBot
-# Version: v2.0.3
+# Version: v2.0.4
 #
 # CHANGELOG
-# v2.0.3 (2025-09-18)
-# - Added SHOW_QUERIED_NAME_IN_HEADER toggle + failsafe in config
-# - Consolidated grouped embeds (one embed per group)
-# - Added subtle dividers between servers in grouped embeds
-# - Multi-webhook support (webhooks[] and webhook_url)
-# - Independent message_id per webhook (no overwrites)
-# - Quiet logging unless warnings/errors
+# v2.0.4 (2025-10-05)
+# - Added downtime_counter (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
+# - Fixed ping_role_id (Which is my bad for never testing before, now it works as intended)
+# - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
+# - Fixed servers not pinging for downtime if the bot was offline when the server went down.
+# - Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
+# - Removed Herobrine
 # ============================================================
 
 
@@ -17,6 +17,7 @@ import a2s
 import requests
 import time
 import os
+import re
 import json
 import random
 import signal
@@ -101,7 +102,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.3"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -174,6 +175,51 @@ server_down = load_json("server_down.json")
 has_pinged_down = load_json("has_pinged_down.json")
 alerts_state = load_json("alerts_state.json")
 ping_routes = load_json("ping_routes.json")
+
+# === Persistent downtime counters (opt-in per server) ===
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DOWNTIME_COUNTERS_PATH = os.environ.get("DOWNTIME_COUNTERS_PATH", os.path.join(_BASE_DIR, "downtime_counters.json"))
+_downtime_counters = {}
+
+def _load_downtime_counters():
+    global _downtime_counters
+    try:
+        if os.path.exists(_DOWNTIME_COUNTERS_PATH):
+            with open(_DOWNTIME_COUNTERS_PATH, "r", encoding="utf-8") as f:
+                _downtime_counters = json.load(f) or {}
+        else:
+            _downtime_counters = {}
+    except Exception:
+        _downtime_counters = {}
+
+def _save_downtime_counters():
+    os.makedirs(os.path.dirname(_DOWNTIME_COUNTERS_PATH), exist_ok=True)
+    try:
+        tmp = _DOWNTIME_COUNTERS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_downtime_counters, f, indent=2, sort_keys=True)
+        os.replace(tmp, _DOWNTIME_COUNTERS_PATH)
+    except Exception:
+        pass
+
+def _srv_key(ip, port):
+    return f"{ip}:{port}"
+
+def _inc_downtime_counter_for(server):
+    try:
+        if server.get("downtime_counter") is True:
+            key = _srv_key(server.get("ip"), server.get("port"))
+            _downtime_counters[key] = int(_downtime_counters.get(key, 0)) + 1
+            _save_downtime_counters()
+    except Exception:
+        pass
+
+def get_downtime_count_for(server):
+    key = _srv_key(server.get("ip"), server.get("port"))
+    try:
+        return int(_downtime_counters.get(key, 0))
+    except Exception:
+        return 0
 
 # Net-freeze (host network outage)
 NET_FREEZE_ACTIVE = False
@@ -517,7 +563,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 header = f"**{display_name}**\n\n"
                 header += (
                     f"📜 Map: `{stats['map']}`\n"
-                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
+                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line + (f"\n❌ Downtime Counter: {get_downtime_count_for(server)}" if server.get("downtime_counter") is True else "")
                 )
 
                 body_lines = []
@@ -589,7 +635,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     header = f"**{stats['queried_name']}**\n\n"
                 header += (
                     f"📜 Map: `{stats['map']}`\n"
-                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line
+                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line + (f"\n❌ Downtime Counter: {get_downtime_count_for(server)}" if server.get("downtime_counter") is True else "")
                 )
 
                 body_lines = []
@@ -725,14 +771,70 @@ def edit_discord_message(group, msg_id, embeds, webhook_url, rk):
     alert_issue("Failed to update status message", "Discord rejected the edit message request.",
                 {"group": group, "webhook": webhook_url, "msg_id": msg_id, "error": errtxt}, key=f"edit:fail:{rk}")
 
+
+def selftest_ping(server):
+    """Send a one-off ping to validate role/user mentions and webhook routing."""
+    try:
+        webhook = _server_primary_webhook(server)
+    except Exception:
+        webhook = server.get("webhook_url") or DEFAULT_WEBHOOK_URL
+
+    if _is_placeholder_webhook(webhook):
+        logger.error("[SELFTEST] Missing/placeholder webhook for %s", server.get("name"))
+        return False
+
+    allowed = {"parse": [], "users": [], "roles": []}
+    mention = None
+
+    role_id = server.get("ping_role_id")
+    if role_id:
+        rid = re.sub(r"\D", "", str(role_id))  # sanitize: keep digits only
+        mention = f"<@&{rid}>" if rid else None
+        allowed["roles"] = [rid] if rid else []
+    else:
+        ping_id = server.get("ping_id", DEFAULT_USER_PING_ID)
+        if ping_id:
+            digits = "".join(ch for ch in str(ping_id) if ch.isdigit())
+            if digits:
+                mention = f"<@{digits}>"
+                allowed["users"] = [digits]
+
+    content = (f"{mention} ✅ SELFTEST: role/user mention delivery check for `{server['name']}`"
+               if mention else f"✅ SELFTEST: basic message for `{server['name']}` (no mention configured)")
+    payload = {"content": content, "allowed_mentions": allowed}
+
+    resp, err = discord_request("POST", webhook + "?wait=true", json_payload=payload, timeout=20)
+    if resp and resp.status_code in (200, 204):
+        try:
+            data = resp.json()
+            logger.info("[SELFTEST] Delivered to %s as message %s", server.get("name"), data.get("id"))
+        except Exception:
+            logger.info("[SELFTEST] Delivered to %s", server.get("name"))
+        return True
+
+    errtxt = err or (f"{getattr(resp,'status_code','???')} - {getattr(resp,'text','')[:160]}")
+    logger.error("[SELFTEST] Failed for %s: %s", server.get("name"), errtxt)
+    return False
+
+def _server_primary_webhook(server):
+    """Pick the webhook to ping: explicit webhook_url, else first in webhooks list, else DEFAULT."""
+    wh = server.get("webhook_url")
+    if wh and not _is_placeholder_webhook(wh):
+        return wh
+    hooks = server.get("webhooks")
+    if isinstance(hooks, list) and hooks:
+        return hooks[0]
+    return DEFAULT_WEBHOOK_URL
+
+
 def post_ping(server):
     role_id = server.get("ping_role_id")
     raw = None
-    allowed = {"users": [], "roles": []}
+    allowed = {"parse": [], "users": [], "roles": []}
     if role_id:
-        role_id_str = str(role_id).strip()
-        raw = f"<@&{role_id_str}>"
-        allowed["roles"] = [role_id_str]
+        role_id_str = re.sub(r"\D", "", str(role_id))  # sanitize digits only
+        raw = f"<@&{role_id_str}>" if role_id_str else None
+        allowed["roles"] = [role_id_str] if role_id_str else []
     else:
         ping_id = server.get("ping_id", DEFAULT_USER_PING_ID)
         if ping_id:
@@ -741,7 +843,7 @@ def post_ping(server):
             if cleaned:
                 allowed["users"] = [cleaned]
 
-    webhook = server.get("webhook_url", DEFAULT_WEBHOOK_URL)
+    webhook = _server_primary_webhook(server)
     if _is_placeholder_webhook(webhook):
         alert_issue("Missing webhook for ping", "Server down ping could not be delivered (no webhook).",
                     {"server": server.get("name")}, key=f"missing:ping:{server.get('name')}:{server.get('ip')}:{server.get('port')}")
@@ -764,6 +866,55 @@ def post_ping(server):
 
 # === Config sanity checks ===
 def validate_config(servers):
+
+    # --- Optional self-test ping and exit ---
+    # ENV: SELFTEST=1 and optional SELFTEST_SERVER="name or ip:port"
+    # CLI: --selftest  or --selftest=<name|ip:port>
+    run_selftest = False
+    targets = servers
+
+    if str(os.environ.get("SELFTEST", "")).strip().lower() in ("1", "true", "yes"):
+        run_selftest = True
+        target_name = os.environ.get("SELFTEST_SERVER")
+        if target_name and target_name.lower() != "all":
+            tn = target_name.strip().lower()
+            def _match(s):
+                name = str(s.get("name","")).lower()
+                ip = str(s.get("ip","")).strip()
+                port = str(s.get("port","")).strip()
+                return (tn in name) or (tn == f"{ip}:{port}")
+            targets = [s for s in servers if _match(s)]
+            if not targets:
+                logger.warning("[SELFTEST] No servers matched SELFTEST_SERVER=%s; defaulting to all.", target_name)
+                targets = servers
+
+    for arg in list(sys.argv[1:]):
+        if arg.startswith("--selftest"):
+            run_selftest = True
+            if "=" in arg:
+                tn = arg.split("=",1)[1].strip().lower()
+                if tn and tn != "all":
+                    def _match(s):
+                        name = str(s.get("name","")).lower()
+                        ip = str(s.get("ip","")).strip()
+                        port = str(s.get("port","")).strip()
+                        return (tn in name) or (tn == f"{ip}:{port}")
+                    targets = [s for s in servers if _match(s)]
+                    if not targets:
+                        logger.warning("[SELFTEST] No servers matched --selftest=%s; defaulting to all.", tn)
+                        targets = servers
+
+    if run_selftest:
+        ok = 0
+        for s in targets:
+            try:
+                if selftest_ping(s):
+                    ok += 1
+            except Exception as e:
+                logger.error("[SELFTEST] Exception for %s: %s", s.get("name"), e)
+        logger.info("[SELFTEST] Completed: %d/%d delivered.", ok, len(targets))
+        return
+        
     seen = {}
     dups = []
     for s in servers:
@@ -801,7 +952,7 @@ def route_key(display_key, webhook):
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.3 (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -822,6 +973,15 @@ if __name__ == "__main__":
     validate_config(servers)
 
     # Initialize per-server state
+
+    # Reconcile 'has_pinged_down' flags with stored ping message ids at startup.
+    _reconciled = False
+    for _rk, _flag in list(has_pinged_down.items()):
+        if _flag and _rk not in ping_message_ids:
+            has_pinged_down[_rk] = False
+            _reconciled = True
+    if _reconciled:
+        save_json("has_pinged_down.json", has_pinged_down)
     downtime_counter = {}
     for s in servers:
         ip, port = s["ip"], s["port"]
@@ -997,15 +1157,33 @@ if __name__ == "__main__":
                     if not server_down.get(key, False):
                         server_down[key] = True
                     if not has_pinged_down.get(key, False):
-                        has_pinged_down[key] = True
                         if key not in ping_message_ids:
                             pid = post_ping(s)
                             if pid:
                                 ping_message_ids[key] = pid
-                                webhook_url = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
+                                has_pinged_down[key] = True
+                                save_json("has_pinged_down.json", has_pinged_down)
+                                webhook_url = _server_primary_webhook(s)
                                 ping_routes[key] = webhook_url
                                 save_json("ping_message_ids.json", ping_message_ids)
                                 save_json("ping_routes.json", ping_routes)
+                                _inc_downtime_counter_for(s)
+# If we haven't sent a downtime ping yet, keep this server visible with an unreachable banner
+                if not has_pinged_down.get(key, False):
+                    display_stats = {
+                        "name": s.get("name"),
+                        "map": "🟥 Temporarily unreachable",
+                        "players": 0,
+                        "max_players": s.get("max_players", 0),
+                        "player_names": [],
+                        "password_protected": None,
+                        "queried_name": s.get("name"),
+                    }
+                    hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
+                    for server_hook in hooks:
+                        merge_key = get_merge_group_key(s)
+                        rk = route_key(merge_key, server_hook)
+                        grouped_routes.setdefault(rk, []).append((s, display_stats))
 
         logger.info("[CYCLE] Up: %s  Down: %s  Routes: %s", up_count, down_count, len(grouped_routes))
 
@@ -1065,6 +1243,8 @@ if __name__ == "__main__":
             for rk, pairs in grouped_routes.items():
                 merge_key, webhook_url = rk.split("|", 1)
                 display_label = get_display_group(pairs[0][0])
+                if all((ps.get('map') == '🟥 Temporarily unreachable') for (_sv, ps) in pairs):
+                    display_label += ' ⚠️ Temporarily unreachable'  # UNREACHABLE GROUP PATCH'
                 embeds = build_grouped_embeds({display_label: pairs}, steam_banner=steam_banner)[display_label]
                 if rk in message_ids:
                     edit_discord_message(display_label, message_ids[rk], embeds, webhook_url, rk)

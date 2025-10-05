@@ -1,12 +1,13 @@
-# Discord-A2S-QueryBot (v2.0.3)
+# Discord-A2S-QueryBot (v2.0.4)
 
 ## Changelog
 
-### v2.0.3 (2025-09-18)
-- Added `SHOW_QUERIED_NAME_IN_HEADER` toggle in config
-- Added support for `webhooks[]` array (servers can post to multiple webhooks)
-- Grouped embeds now include subtle dividers between servers for readability
-- I broke server Emojis, sorry. Just add it manually to the name or the group values in your servers.json.
+### v2.0.4 (2025-10-05)
+- Added `downtime_counter` toggle for individual servers (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
+- Fixed `ping_role_id` (Which is my bad for never testing before, now it works as intended)
+- Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
+- Fixed servers not pinging for downtime if the bot was offline when the server went down.
+- Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -100,6 +101,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `ping_role_id` | ❌ | string/int | Per-server **role** mention for down pings (e.g., role id `987654...`). |
 | `show_players` | ❌ | boolean | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
 | `show_visibility` | ❌ | boolean | if SHOW_VISIBILITY_BY_DEFAULT is false, setting this to true in your servers.json will show if that specific server is password protected or public. |
+| `downtime_counter` | ❌ | boolean | if downtime_counter is set to true, will count the amount of times the server goes down, poke the server admins about it. |
 
 ### Example
 ```json
