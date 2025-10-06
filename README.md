@@ -8,6 +8,7 @@
 - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
 - Fixed servers not pinging for downtime if the bot was offline when the server went down.
 - Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
+- Fixed downtime counters not persisting across restarts.
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
