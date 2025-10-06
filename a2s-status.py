@@ -1,14 +1,15 @@
 # ============================================================
 # Discord-A2S-QueryBot
-# Version: v2.0.4
+# Version: v2.0.4b
 #
 # CHANGELOG
-# v2.0.4 (2025-10-05)
+# v2.0.4b (2025-10-05)
 # - Added downtime_counter (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
 # - Fixed ping_role_id (Which is my bad for never testing before, now it works as intended)
 # - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
 # - Fixed servers not pinging for downtime if the bot was offline when the server went down.
 # - Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
+# - Fixed Downtime Counters not persisting across restarts (2.0.4b)
 # - Removed Herobrine
 # ============================================================
 
@@ -102,7 +103,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4b"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -864,10 +865,11 @@ def post_ping(server):
                 {"server": server.get("name"), "webhook": webhook, "error": errtxt}, key=f"ping:fail:{server.get('name')}|{webhook}")
     return None
 
+
 # === Config sanity checks ===
 def validate_config(servers):
-
-    # --- Optional self-test ping and exit ---
+    _load_downtime_counters()  # load persistent downtime counters
+# --- Optional self-test ping and exit ---
     # ENV: SELFTEST=1 and optional SELFTEST_SERVER="name or ip:port"
     # CLI: --selftest  or --selftest=<name|ip:port>
     run_selftest = False
@@ -946,13 +948,16 @@ def validate_config(servers):
 # === Main helpers ===
 def make_server_key(ip, port):
     return f"{ip}:{port}"
+    """Lightweight config validation stub (kept minimal to avoid runtime errors)."""
+    return
+
 
 def route_key(display_key, webhook):
     return f"{display_key}|{webhook}"
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4 (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4b (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -962,6 +967,7 @@ if __name__ == "__main__":
             save_json("has_pinged_down.json", has_pinged_down)
             save_json("message_ids.json", message_ids)
             save_json("ping_message_ids.json", ping_message_ids)
+            _save_downtime_counters()  # flush persistent downtime counters
             _save_net_state()
         finally:
             sys.exit(0)
