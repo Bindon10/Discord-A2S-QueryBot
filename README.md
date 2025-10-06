@@ -1,8 +1,8 @@
-# Discord-A2S-QueryBot (v2.0.4)
+# Discord-A2S-QueryBot (v2.0.4b)
 
 ## Changelog
 
-### v2.0.4 (2025-10-05)
+### v2.0.4b (2025-10-05)
 - Added `downtime_counter` toggle for individual servers (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
 - Fixed `ping_role_id` (Which is my bad for never testing before, now it works as intended)
 - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
