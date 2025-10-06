@@ -1,15 +1,16 @@
 # ============================================================
 # Discord-A2S-QueryBot
-# Version: v2.0.4b
+# Version: v2.0.4c
 #
 # CHANGELOG
-# v2.0.4b (2025-10-05)
+# v2.0.4c (2025-10-05)
 # - Added downtime_counter (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
 # - Fixed ping_role_id (Which is my bad for never testing before, now it works as intended)
 # - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
 # - Fixed servers not pinging for downtime if the bot was offline when the server went down.
 # - Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
 # - Fixed Downtime Counters not persisting across restarts (2.0.4b)
+# - Added redundancy checks for downtime pings (2.0.4c)
 # - Removed Herobrine
 # ============================================================
 
@@ -103,7 +104,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4b"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4c"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -176,6 +177,41 @@ server_down = load_json("server_down.json")
 has_pinged_down = load_json("has_pinged_down.json")
 alerts_state = load_json("alerts_state.json")
 ping_routes = load_json("ping_routes.json")
+# Startup reconciliation: remove orphaned routes with no corresponding message id
+try:
+    _orphans = [k for k in list(ping_routes.keys()) if k not in ping_message_ids]
+    if _orphans:
+        for _k in _orphans:
+            ping_routes.pop(_k, None)
+        save_json("ping_routes.json", ping_routes)
+except Exception:
+    pass
+
+# Startup backfill: for any existing ping message without a saved route, infer route from servers.json
+try:
+    servers_for_backfill, _ = load_servers_and_detect_example_mode()
+    _added = False
+    for _key in list(ping_message_ids.keys()):
+        if _key not in ping_routes:
+            try:
+                _ip, _port = _key.split(":", 1)
+                _port = int(_port)
+            except Exception:
+                continue
+            # find matching server by ip:port
+            for _s in servers_for_backfill:
+                if _s.get("ip") == _ip and int(_s.get("port", 0)) == _port:
+                    _wh = _server_primary_webhook(_s)
+                    if _wh and not _is_placeholder_webhook(_wh):
+                        ping_routes[_key] = _wh
+                        _added = True
+                    break
+    if _added:
+        save_json("ping_routes.json", ping_routes)
+except Exception:
+    pass
+
+
 
 # === Persistent downtime counters (opt-in per server) ===
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -957,7 +993,7 @@ def route_key(display_key, webhook):
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4b (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4c (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -974,8 +1010,8 @@ if __name__ == "__main__":
     for _sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
         if _sig:
             signal.signal(_sig, _graceful_exit)
-
     servers, example_mode = load_servers_and_detect_example_mode()
+
     validate_config(servers)
 
     # Initialize per-server state
@@ -1020,9 +1056,27 @@ if __name__ == "__main__":
         # Hot reload servers.json each cycle
         servers, example_mode = load_servers_and_detect_example_mode()
 
-        # Reconcile state dicts vs current servers.json
 
-        # Reconcile route keys (handles group/webhook changes)
+        # Runtime backfill: ensure ping_routes exist for any existing ping messages (first loop & hot-reloads)
+        try:
+            _added_rt = False
+            # Build quick ip:port -> server map for this cycle
+            _srv_index = {f"{_s.get('ip')}:{int(_s.get('port', 0))}": _s for _s in servers if _s.get('ip') and _s.get('port')}
+            for _key in list(ping_message_ids.keys()):
+                if _key not in ping_routes:
+                    _s = _srv_index.get(_key)
+                    if _s:
+                        _wh = _server_primary_webhook(_s)
+                        if _wh and not _is_placeholder_webhook(_wh):
+                            ping_routes[_key] = _wh
+                            _added_rt = True
+            if _added_rt:
+                save_json("ping_routes.json", ping_routes)
+        except Exception:
+            pass
+
+        # Reconcile state dicts vs current servers.json
+                # Reconcile route keys (handles group/webhook changes)
         expected_route_keys = set()
         for s in servers:
             hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
@@ -1137,13 +1191,18 @@ if __name__ == "__main__":
                     has_pinged_down[key] = False
                     if key in ping_message_ids:
                         try:
-                            delete_ping_url = s.get("webhook_url", DEFAULT_WEBHOOK_URL)
-                            if delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
-                                discord_request("DELETE", f"{delete_ping_url}/messages/{ping_message_ids[key]}", timeout=10)
+                            # Prefer the exact webhook used to post the ping; fall back to primary.
+                            delete_ping_url = ping_routes.get(key, _server_primary_webhook(s))
+                            msg_id = ping_message_ids.get(key)
+                            if msg_id and delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
+                                delete_discord_message(msg_id, delete_ping_url, label=f"recovered ping {key}")
                         except Exception:
                             pass
+                        # Drop both the message id and the stored route
                         ping_message_ids.pop(key, None)
+                        ping_routes.pop(key, None)
                         save_json("ping_message_ids.json", ping_message_ids)
+                        save_json("ping_routes.json", ping_routes)
                 else:
                     downtime_counter[key] = 0
                     has_pinged_down[key] = False
