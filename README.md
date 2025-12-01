@@ -2,14 +2,8 @@
 
 ## Changelog
 
-### v2.0.4c (2025-10-05)
-- Added `downtime_counter` toggle for individual servers (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
-- Fixed `ping_role_id` (Which is my bad for never testing before, now it works as intended)
-- Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
-- Fixed servers not pinging for downtime if the bot was offline when the server went down.
-- Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
-- Fixed downtime counters not persisting across restarts.
-- Added redundancy checks for downtime pings (2.0.4c)
+### v2.0.5 (2025-11-30)
+- Added a primary admin entry option to embed into the server information
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
@@ -104,6 +98,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `show_players` | ❌ | boolean | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
 | `show_visibility` | ❌ | boolean | if SHOW_VISIBILITY_BY_DEFAULT is false, setting this to true in your servers.json will show if that specific server is password protected or public. |
 | `downtime_counter` | ❌ | boolean | if downtime_counter is set to true, will count the amount of times the server goes down, poke the server admins about it. |
+| `owner` | ❌ | boolean | Displays the primary server admin above the map and players information |
 
 ### Example
 ```json
@@ -113,6 +108,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "ip": "123.45.67.89",
     "port": 27016,
     "group": "Mirage: Arcane Warfare",
+	"admin": "<@123456789012345678>",
     "restart": true,
     "restart_hour": "04",
     "restart_minute": "30",
@@ -125,6 +121,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "ip": "123.45.67.90",
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
+	"admin": "<@123456789012345678>",
     "restart": false,
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
@@ -133,6 +130,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "ip": "123.45.67.90",
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
+	"admin": "<@123456789012345678>",
     "restart": false,
     "webhooks": [
 		"https://discord.com/api/webhooks/.../...",

@@ -1,16 +1,10 @@
 # ============================================================
 # Discord-A2S-QueryBot
-# Version: v2.0.4c
+# Version: v2.0.5
 #
 # CHANGELOG
-# v2.0.4c (2025-10-05)
-# - Added downtime_counter (just lil per server downtime counter for those servers that constantly going down *lookin at you Turtle Pond*)
-# - Fixed ping_role_id (Which is my bad for never testing before, now it works as intended)
-# - Added Temporarily Unreachable banner for servers that haven't hit the downtime ping threshold
-# - Fixed servers not pinging for downtime if the bot was offline when the server went down.
-# - Added --selftest startup var to test if ping_id & ping_role_id were configured correctly (this was meant to be for debugging but I don't want to take it out) 
-# - Fixed Downtime Counters not persisting across restarts (2.0.4b)
-# - Added redundancy checks for downtime pings (2.0.4c)
+# v2.0.5 (2025-11-30)
+# - Added a primary admin entry option to embed into the server information
 # - Removed Herobrine
 # ============================================================
 
@@ -26,6 +20,7 @@ import signal
 import sys
 import shutil
 from datetime import datetime
+from datetime import timezone
 from zoneinfo import ZoneInfo
 import socket
 import logging
@@ -598,9 +593,21 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
 
                 display_name = stats.get('queried_name') if SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name') else server['name']
                 header = f"**{display_name}**\n\n"
+                
+                # NEW — owner/admin field
+                owner = server.get("owner")
+                if owner:
+                    header += f"🛡️ Admin: {owner}\n"
+                
                 header += (
                     f"📜 Map: `{stats['map']}`\n"
-                    f"👥 Players: `{stats['players']} / {stats['max_players']}`" + vis_line + (f"\n❌ Downtime Counter: {get_downtime_count_for(server)}" if server.get("downtime_counter") is True else "")
+                    f"👥 Players: `{stats['players']} / {stats['max_players']}`"
+                    + vis_line
+                    + (
+                        f"\n❌ Downtime Counter: {get_downtime_count_for(server)}"
+                        if server.get("downtime_counter") is True
+                        else ""
+                    )
                 )
 
                 body_lines = []
@@ -649,7 +656,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 "title": group_name,
                 "description": combined_desc,
                 "color": 0x7F00FF,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "footer": {"text": "Updated every 60 seconds"},
             }
             if steam_banner:
@@ -715,7 +722,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     "title": title_text,
                     "description": desc,
                     "color": 0x7F00FF,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "footer": {"text": "Updated every 60 seconds"},
                 }
 
