@@ -98,7 +98,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `show_players` | ❌ | boolean | If SHOW_PLAYERS_BY_DEFAULT is false, setting this to true in your servers.json will re-enable the player list for that specific server. |
 | `show_visibility` | ❌ | boolean | if SHOW_VISIBILITY_BY_DEFAULT is false, setting this to true in your servers.json will show if that specific server is password protected or public. |
 | `downtime_counter` | ❌ | boolean | if downtime_counter is set to true, will count the amount of times the server goes down, poke the server admins about it. |
-| `owner` | ❌ | string | Displays the primary server admin above the map and players information |
+| `owner` | ❌ | string | Displays the primary server admin above the map and players information (For role IDs use "<@&>" Example: <@&123456789012345678>) |
 
 ### Example
 ```json
