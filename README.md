@@ -1,4 +1,4 @@
-# Discord-A2S-QueryBot (v2.0.4c)
+# Discord-A2S-QueryBot (v2.0.5)
 
 ## Changelog
 
