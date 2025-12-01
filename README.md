@@ -113,7 +113,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "restart_hour": "04",
     "restart_minute": "30",
     "timezone": "America/Edmonton",
-    "ping_role_id": "123456789012345678",
+    "ping_role_id": "<@123456789012345678>",
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
   {
@@ -122,6 +122,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
 	"admin": "<@123456789012345678>",
+	"ping_id": "<@123456789012345678>",
     "restart": false,
     "webhook_url": "https://discord.com/api/webhooks/.../..."
   },
@@ -131,6 +132,7 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
     "port": 27015,
     "group": "Chivalry: Medieval Warfare",
 	"admin": "<@123456789012345678>",
+	"ping_id": "<@123456789012345678>",
     "restart": false,
     "webhooks": [
 		"https://discord.com/api/webhooks/.../...",
