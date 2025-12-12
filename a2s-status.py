@@ -1,11 +1,11 @@
 # ============================================================
 # Discord-A2S-QueryBot
-# Version: v2.0.5
+# Version: v2.0.6
 #
 # CHANGELOG
-# v2.0.5 (2025-11-30)
-# - Added a primary admin entry option to embed into the server information
-# - Removed Herobrine
+# v2.0.6 (2025-12-08)
+# - Added option to disable pings in server.json 
+# - Removed Sanity
 # ============================================================
 
 
@@ -99,7 +99,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.4c"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.0.6"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -1000,7 +1000,7 @@ def route_key(display_key, webhook):
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.4c (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.0.6 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -1196,20 +1196,22 @@ if __name__ == "__main__":
                     server_down[key] = False
                     downtime_counter[key] = 0
                     has_pinged_down[key] = False
+                
+                    # Clean up ping message only if it existed (won't for disable_pings)
                     if key in ping_message_ids:
                         try:
-                            # Prefer the exact webhook used to post the ping; fall back to primary.
                             delete_ping_url = ping_routes.get(key, _server_primary_webhook(s))
                             msg_id = ping_message_ids.get(key)
                             if msg_id and delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
                                 delete_discord_message(msg_id, delete_ping_url, label=f"recovered ping {key}")
                         except Exception:
                             pass
-                        # Drop both the message id and the stored route
+                
                         ping_message_ids.pop(key, None)
                         ping_routes.pop(key, None)
                         save_json("ping_message_ids.json", ping_message_ids)
                         save_json("ping_routes.json", ping_routes)
+                
                 else:
                     downtime_counter[key] = 0
                     has_pinged_down[key] = False
@@ -1226,20 +1228,31 @@ if __name__ == "__main__":
                 cur = prev + 1
                 downtime_counter[key] = cur
                 if cur >= DOWN_FAIL_THRESHOLD:
+                    # Mark server as down
                     if not server_down.get(key, False):
                         server_down[key] = True
-                    if not has_pinged_down.get(key, False):
-                        if key not in ping_message_ids:
-                            pid = post_ping(s)
-                            if pid:
-                                ping_message_ids[key] = pid
-                                has_pinged_down[key] = True
-                                save_json("has_pinged_down.json", has_pinged_down)
-                                webhook_url = _server_primary_webhook(s)
-                                ping_routes[key] = webhook_url
-                                save_json("ping_message_ids.json", ping_message_ids)
-                                save_json("ping_routes.json", ping_routes)
-                                _inc_downtime_counter_for(s)
+                
+                    # NEW: disable_pings flag
+                    pings_disabled = bool(s.get("disable_pings", False))
+                
+                    # If pings are disabled, do NOT post downtime pings
+                    if pings_disabled:
+                        has_pinged_down[key] = False
+                    else:
+                        # Normal ping behavior
+                        if not has_pinged_down.get(key, False):
+                            if key not in ping_message_ids:
+                                pid = post_ping(s)
+                                if pid:
+                                    ping_message_ids[key] = pid
+                                    has_pinged_down[key] = True
+                                    save_json("has_pinged_down.json", has_pinged_down)
+                                    webhook_url = _server_primary_webhook(s)
+                                    ping_routes[key] = webhook_url
+                                    save_json("ping_message_ids.json", ping_message_ids)
+                                    save_json("ping_routes.json", ping_routes)
+                                    _inc_downtime_counter_for(s)
+                
 # If we haven't sent a downtime ping yet, keep this server visible with an unreachable banner
                 if not has_pinged_down.get(key, False):
                     display_stats = {
