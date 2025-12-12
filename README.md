@@ -1,9 +1,9 @@
-# Discord-A2S-QueryBot (v2.0.5)
+# Discord-A2S-QueryBot (v2.0.6)
 
 ## Changelog
 
-### v2.0.5 (2025-11-30)
-- Added a primary admin entry option to embed into the server information
+### v2.0.6 (2025-12-11)
+- Added servers.json option to disable downtime pings.
 
 A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
 No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
