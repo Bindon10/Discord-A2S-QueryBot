@@ -74,7 +74,6 @@ On first run the bot creates an example `servers.json`, shows a **yellow** examp
 | `DOWN_FAIL_THRESHOLD` | Consecutive failed polls before a **down** ping. | Default `3`.
 | `GROUP_EMBED_LIMIT` | Max embeds per message. | Discord hard cap is 10. |
 | `EMBED_DESC_LIMIT` | Max characters in one embed description. | Discord hard cap is 4096. |
-| `STALE_PURGE_ENABLED` | Purge obsolete message IDs. | Leave `False` unless you want automatic cleanup. |
 | `SHOW_VISIBILITY_BY_DEFAULT` | Shows if a server is password protected | Leave false to hide this information by default. |
 | `DEBUG_LOG_ENABLED` | Enables debug logging to file in case of an issue | Defaults to false, messages still log to console. |
 
