@@ -1,12 +1,11 @@
-# Discord-A2S-QueryBot (v2.0.6)
+# Discord-A2S-QueryBot (v2.3.4)
 
-## Changelog
 
-### v2.0.6 (2025-12-11)
-- Added servers.json option to disable downtime pings.
+# Changelog
 
-A lightweight **Steam A2S query bot** for Discord that displays live server info and notifies you when a server goes down.
-No plugins, RCON, or server mods required — it talks to your game servers the same way the Steam server browser does.
+- Added WebUI (Binds to 0.0.0.0 on Port 8500 by default)
+- Fixed some issues with Example Mode, not really an issue because the WebUI provides mostly all the settings you need
+- Steam API Key and default admin login is still handled in the .py file so it's not exposed. (Change the default password "ThisIsADefaultPasswordChangeMe")
 
 ---
 ## 📸 Example Screenshot
