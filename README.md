@@ -36,11 +36,12 @@
 - Python **3.9+**
 - `python-a2s`
 - `requests`
+- `flask`
 - A Discord **Webhook URL** (at least one — either a default or per-server override)
 
 Install deps:
 ```bash
-pip install python-a2s requests
+pip install python-a2s requests flask
 ```
 
 ---
