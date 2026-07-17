@@ -272,4 +272,4 @@ How to get a key:
 ---
 
 ## 📄 License
-MIT — use, modify, and share freely.
+MIT — use, modify, and share freely. - Use this code however you would like. I do not care; just leave me out of whatever petty legal bullshit you come up with. I will not respond to emails regarding this project.
