@@ -1,6 +1,8 @@
 # ============================================================
+#
 # Discord-A2S-QueryBot
-# Version: v2.3.4
+# Version: v2.5.0
+#
 # ============================================================
 
 
@@ -20,6 +22,8 @@ from zoneinfo import ZoneInfo
 import socket
 import logging
 import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from logging.handlers import RotatingFileHandler
 
@@ -57,8 +61,11 @@ IGNORED_STEAM_SERVICE_KEYS = {"IEconItems"}          # noisy keys to ignore when
 
 # Behavior knobs
 DOWN_FAIL_THRESHOLD = 3        # consecutive failures before a server is considered down (and pinged)
+QUERY_MAX_WORKERS   = 16       # concurrent A2S queries per cycle (keeps large lists inside the interval)
 GROUP_EMBED_LIMIT   = 10       # Discord hard cap per message
 EMBED_DESC_LIMIT    = 4096     # Discord hard cap per embed description
+# (v2.3.0) STALE_PURGE_ENABLED removed — always-on route reconciliation cleans stale
+# status messages; stuck downtime pings are revoked from the web UI Messages tab.
 SHOW_PLAYERS_BY_DEFAULT = True # default: show player list in embeds (override per-server with 'show_players')
 SHOW_VISIBILITY_BY_DEFAULT = False # default: show visibility line (Public/Passworded) per server; override with 'show_visibility'
 GHOST_PLAYER_FIX_BY_DEFAULT = False # treat a nonzero player count with an EMPTY name list as 0 players (A2S ghost-player quirk); override per server with 'ghost_player_fix'
@@ -68,7 +75,7 @@ PLAYER_LIST_LIMIT   = 20       # max number of player names to show in embeds
 WEB_UI_ENABLED  = True          # set False to disable the embedded web UI
 WEB_UI_HOST     = "0.0.0.0"     # bind address (LAN-exposed by default — set WEBUI_PASSWORD and/or add users!)
 WEB_UI_PORT     = 8500
-WEB_UI_PASSWORD = os.getenv("WEBUI_PASSWORD", "ThisIsADefaultPasswordChangeMe").strip()  # break-glass admin login; blank + no users = auth disabled (keep it on localhost then)
+WEB_UI_PASSWORD = os.getenv("WEBUI_PASSWORD", "LukeIAmYourPassword").strip()  # break-glass admin login; blank + no users = auth disabled (keep it on localhost then)
 WEB_UI_PUBLIC_URL = os.getenv("WEBUI_PUBLIC_URL", "").strip()  # base URL browsers use (e.g. "https://status.example.com") — needed for Steam sign-in behind a proxy; blank = auto-detect
 
 # Failsafe: make sure SHOW_QUERIED_NAME_IN_HEADER is always defined
@@ -124,7 +131,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.3.4"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.5.0"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -505,34 +512,50 @@ def build_steam_banner(steam_unhealthy: bool, last_check_epoch: float, snapshot)
     )
 
 # === A2S ===
-def fetch_stats(ip, port):
-    addr = (ip, port)
+def _is_ip_literal(host: str) -> bool:
     try:
-        info = a2s.info(addr, timeout=2.0)
-        players = a2s.players(addr, timeout=2.0)
-        names = [p.name for p in players if p.name.strip()]
+        socket.inet_aton(str(host))
+        return True
+    except OSError:
+        return False
 
-        # Password visibility (library field) + fallback via rules
-        passworded = getattr(info, "password_protected", None)
-        if passworded is None:
-            try:
-                rules = a2s.rules(addr, timeout=2.5)
-                if "sv_password" in rules:
-                    passworded = (str(rules["sv_password"]).strip() not in ("", "0"))
-            except Exception:
-                passworded = None
+def fetch_stats(ip, port):
+    """Query a server. NOTE: the configured host string (domain or IP) is passed
+    straight to the OS resolver on every query — the bot never caches or stores
+    a resolved IP, so dynamic-IP domains keep working. Hostname queries retry
+    once on failure to ride out DNS flaps."""
+    addr = (ip, port)
+    attempts = 1 if _is_ip_literal(ip) else 2
+    for attempt in range(attempts):
+        try:
+            info = a2s.info(addr, timeout=2.0)
+            players = a2s.players(addr, timeout=2.0)
+            names = [p.name for p in players if p.name.strip()]
 
-        return {
-            "name": info.server_name,
-            "map": info.map_name,
-            "players": info.player_count,
-            "max_players": info.max_players,
-            "player_names": names,
-            "password_protected": passworded,
-        }
-    except Exception as e:
-        logger.info("[INFO] Query failed for %s:%s: %s", ip, port, e)
-        return None
+            # Password visibility (library field) + fallback via rules
+            passworded = getattr(info, "password_protected", None)
+            if passworded is None:
+                try:
+                    rules = a2s.rules(addr, timeout=2.5)
+                    if "sv_password" in rules:
+                        passworded = (str(rules["sv_password"]).strip() not in ("", "0"))
+                except Exception:
+                    passworded = None
+
+            return {
+                "name": info.server_name,
+                "map": info.map_name,
+                "players": info.player_count,
+                "max_players": info.max_players,
+                "player_names": names,
+                "password_protected": passworded,
+            }
+        except Exception as e:
+            if attempt + 1 < attempts:
+                time.sleep(0.5)  # brief pause, then a fresh resolve + query
+                continue
+            logger.info("[INFO] Query failed for %s:%s: %s", ip, port, e)
+            return None
 
 # === Restart parsing (accept strings OR numbers) ===
 def _to_int_or_none(v):
@@ -659,6 +682,8 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 _pshown = stats.get('players', 0)
                 if not stats.get('player_names') and bool(server.get('ghost_player_fix', GHOST_PLAYER_FIX_BY_DEFAULT)):
                     _pshown = 0
+                _dport = _to_int_or_none(server.get("display_port"))
+                connect_line = f"\n🔗 Connect: `{_san_code(server.get('ip'))}:{_dport}`" if _dport else ""
                 display_name = stats.get('queried_name') if SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name') else server['name']
                 _emj = server.get("emoji")
                 _pfx = f"{_emj} " if _emj else ""
@@ -673,6 +698,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     f"📜 Map: `{_san_code(stats['map'])}`\n"
                     f"👥 Players: `{_pshown} / {stats['max_players']}`"
                     + vis_line
+                    + connect_line
                     + (
                         f"\n❌ Downtime Counter: {get_downtime_count_for(server)}"
                         if server.get("downtime_counter") is True
@@ -752,6 +778,8 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                 _pshown = stats.get('players', 0)
                 if not stats.get('player_names') and bool(server.get('ghost_player_fix', GHOST_PLAYER_FIX_BY_DEFAULT)):
                     _pshown = 0
+                _dport = _to_int_or_none(server.get("display_port"))
+                connect_line = f"\n🔗 Connect: `{_san_code(server.get('ip'))}:{_dport}`" if _dport else ""
                 header = ""
                 if SHOW_QUERIED_NAME_IN_HEADER and stats.get('queried_name'):
                     header = f"**{_san(stats['queried_name'], 100)}**\n\n"
@@ -760,7 +788,7 @@ def build_grouped_embeds(grouped_servers, steam_banner: str = ""):
                     header += f"🛡️ Admin: {_fmt_user_ref(owner)}\n"
                 header += (
                     f"📜 Map: `{_san_code(stats['map'])}`\n"
-                    f"👥 Players: `{_pshown} / {stats['max_players']}`" + vis_line + (f"\n❌ Downtime Counter: {get_downtime_count_for(server)}" if server.get("downtime_counter") is True else "")
+                    f"👥 Players: `{_pshown} / {stats['max_players']}`" + vis_line + connect_line + (f"\n❌ Downtime Counter: {get_downtime_count_for(server)}" if server.get("downtime_counter") is True else "")
                 )
 
                 body_lines = []
@@ -1138,6 +1166,25 @@ def _load_users():
 def _save_users(users):
     save_json(USERS_FILE, {"users": users})
 
+_LAST_ACTIVE_TOUCHED = {}
+
+def _touch_last_active(sid):
+    """Record web UI activity (throttled: one disk write per 5 min per user)."""
+    if not sid:
+        return
+    now = time.time()
+    if now - _LAST_ACTIVE_TOUCHED.get(sid, 0) < 300:
+        return
+    _LAST_ACTIVE_TOUCHED[sid] = now
+    try:
+        with _CFG_LOCK:
+            users = _load_users()
+            if sid in users:
+                users[sid]["last_active"] = now
+                _save_users(users)
+    except Exception:
+        pass
+
 def _check_login(username: str, password: str):
     """Single shared credential for now. To expand into a full user/permission
     system later, replace this dict with a users.json lookup — the session and
@@ -1174,6 +1221,13 @@ def _validate_servers_payload(data):
         if s.get("editors") is not None and not (
                 isinstance(s.get("editors"), list) and all(isinstance(x, str) for x in s["editors"])):
             errs.append(f"{label}: 'editors' must be a list of SteamID64 strings")
+        if s.get("display_port") is not None:
+            try:
+                _dp = int(s["display_port"])
+                if not (1 <= _dp <= 65535):
+                    raise ValueError
+            except Exception:
+                errs.append(f"{label}: invalid 'display_port' (1-65535)")
         if s.get("restart"):
             _h, _m, err = parse_restart_time(s)
             if err:
@@ -1247,6 +1301,8 @@ RUNTIME_SETTINGS = {
     "SHOW_VISIBILITY_BY_DEFAULT": {"type": bool, "label": "Show visibility (public/passworded) by default"},
     "PLAYER_LIST_LIMIT":          {"type": int,  "min": 1,   "max": 100,  "label": "Player list limit"},
     "GHOST_PLAYER_FIX_BY_DEFAULT": {"type": bool, "label": "Ghost player fix by default (count with empty name list -> 0)"},
+    "DOWN_FAIL_THRESHOLD":        {"type": int,  "min": 1,   "max": 60,   "label": "Down fail threshold (cycles before a server counts as down)"},
+    "QUERY_MAX_WORKERS":          {"type": int,  "min": 1,   "max": 64,   "label": "Concurrent query workers"},
 }
 
 def _apply_settings_overrides():
@@ -1304,6 +1360,7 @@ def start_web_ui():
                 if age > 86400:  # sliding renewal, at most once/day per session
                     sess["created"] = time.time()
                     _save_sessions()
+                _touch_last_active(sess.get("steamid"))
                 return sess
             _WEB_SESSIONS.pop(tok, None)
             _save_sessions()
@@ -1369,6 +1426,7 @@ def start_web_ui():
             "authed": sess is not None,
             "user": (sess or {}).get("user"),
             "role": (sess or {}).get("role"),
+            "steamid": (sess or {}).get("steamid"),
             "perms": (sess or {}).get("perms") or [],
         })
 
@@ -1448,6 +1506,7 @@ def start_web_ui():
                 u["name"] = p.get("name") or u.get("name")
                 u["avatar"] = p.get("avatar") or u.get("avatar")
             u["last_login"] = time.time()
+            u["last_active"] = time.time()
             users[sid] = u
             _save_users(users)
         logger.info("[WEBUI] Steam login: %s (%s, role=%s)", u.get("name") or sid, sid, u.get("role"))
@@ -1542,7 +1601,7 @@ def start_web_ui():
             return err
         st = dict(WEB_STATE)
         st["interval"] = INTERVAL_SECONDS
-        st["version"] = "2.3.4"
+        st["version"] = "2.5.0"
         st["uptime_s"] = int(time.time() - WEB_STATE.get("started_at", time.time()))
         return jsonify(st)
 
@@ -1899,6 +1958,13 @@ def start_web_ui():
 
     def _run():
         try:
+            try:
+                from waitress import serve as _serve
+                logger.info("[WEBUI] Serving with waitress (production WSGI) at http://%s:%s", WEB_UI_HOST, WEB_UI_PORT)
+                _serve(app, host=WEB_UI_HOST, port=WEB_UI_PORT, threads=8, ident="a2sbot")
+                return
+            except ImportError:
+                logger.warning("[WEBUI] waitress not installed — using Flask's dev server. For production: pip install waitress")
             app.run(host=WEB_UI_HOST, port=WEB_UI_PORT, debug=False, use_reloader=False, threaded=True)
         except Exception as e:
             logger.error("[WEBUI] Failed to start: %s", e)
@@ -1945,6 +2011,7 @@ legend{color:var(--mut);font-size:12px;padding:0 6px}
 label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.row>div,.row3>div{display:flex;flex-direction:column;justify-content:flex-end}
 @media (max-width:600px){.row,.row3{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>A2S Statusbot</h1><span id="summary" class="mut">loading&hellip;</span><span id="flags"></span>
@@ -1953,13 +2020,13 @@ label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
 <nav>
 <button data-tab="status" class="active">Status</button>
 <button data-tab="servers">Servers</button>
-<button data-tab="logs">Logs</button>
+<button data-tab="groups">Groups</button>
 <button data-tab="controls">Controls</button>
 <button data-tab="messages">Messages</button>
-<button data-tab="groups">Groups</button>
-<button data-tab="users">Users</button>
 <button data-tab="settings">Settings</button>
 <button data-tab="advanced">Advanced</button>
+<button data-tab="users">Users</button>
+<button data-tab="logs">Logs</button>
 </nav>
 <main>
 <section id="tab-status"><div class="grid" id="servers"><div class="mut">loading&hellip;</div></div></section>
@@ -2052,9 +2119,11 @@ label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
     <div><label>Group <span class="mut">(servers sharing a group merge into one embed)</span></label>
     <select id="f_group" onchange="groupSelChange()"></select>
     <input type="text" id="f_group_custom" placeholder="New group name" style="margin-top:6px;display:none"></div></div>
-    <div class="row3"><div><label>IP *</label><input type="text" id="f_ip"></div>
-    <div><label>Port *</label><input type="number" id="f_port" min="1" max="65535"></div>
-    <div><label>Max players <span class="mut">(shown while unreachable)</span></label><input type="number" id="f_maxp" min="0"></div></div>
+    <div class="row3"><div><label>IP / hostname * <span class="mut">(domains stay as-is, re-resolved every query)</span></label><input type="text" id="f_ip"></div>
+    <div><label>Query port * <span class="mut">(A2S)</span></label><input type="number" id="f_port" min="1" max="65535"></div>
+    <div><label>Game port <span class="mut">(optional — adds a Connect line)</span></label><input type="number" id="f_dport" min="1" max="65535"></div></div>
+    <div class="row3"><div><label>Max players <span class="mut">(shown while unreachable)</span></label><input type="number" id="f_maxp" min="0"></div>
+    <div style="display:flex;align-items:flex-end;padding-bottom:2px"><label style="display:flex;align-items:center;gap:8px;margin:0;font-size:13px;color:var(--fg)"><input type="checkbox" id="f_enabled" style="width:auto"> Enabled (queried &amp; posted to Discord)</label></div></div>
     <div class="row3"><div><label>Owner / admin <span class="mut">(user ID &rarr; @user, &amp;id or &lt;@&amp;id&gt; &rarr; @role, or plain text)</span></label><input type="text" id="f_owner" placeholder="user ID, &roleID, or a name"></div>
     <div><label>Emoji <span class="mut">(title prefix)</span></label>
     <div style="display:flex;gap:6px"><input type="text" id="f_emoji">
@@ -2233,7 +2302,7 @@ async function loadStatus(){
 }
 
 // ---- Servers tab ----
-let serversCache = [], editIndex = -1, editOrig = null;
+let serversCache = [], editIndex = -1, editOrig = null, renderedEditorIds = [];
 
 async function loadServers(){
   try{
@@ -2249,7 +2318,9 @@ async function loadServers(){
     }
     grid.innerHTML = serversCache.map((s,i)=>{
       const st = live[s.ip+':'+s.port];
-      const badge = !st ? '<span class="badge warn">PENDING</span>'
+      const disabled = s.enabled === false;
+      const badge = disabled ? '<span class="badge" style="background:#2a2e3d;color:#8b90a0">DISABLED</span>'
+        : !st ? '<span class="badge warn">PENDING</span>'
         : st.up ? '<span class="badge ok">UP</span>'
         : st.down_marked ? '<span class="badge bad">DOWN</span>' : '<span class="badge warn">UNSTABLE</span>';
       const tags = [];
@@ -2261,6 +2332,7 @@ async function loadServers(){
         <div class="mut">${esc(s.ip)}:${esc(s.port)}${s.group?' • '+esc(s.group):''}${s.owner?' • admin: '+esc(s.owner):''}${s.created_by_name?' • by '+esc(s.created_by_name):''}</div>
         ${tags.length?'<div class="mut">'+tags.join(' • ')+'</div>':''}
         ${s._can_edit ? `<div style="margin-top:8px"><button class="act" onclick="openEditor(${i})">Edit</button>
+        <button class="act ghost" onclick="toggleServer(${i})">${disabled?'Enable':'Disable'}</button>
         <button class="act warn" onclick="delServer(${i})">Remove</button></div>` : ''}</div>`;
     }).join('');
   }catch(e){}
@@ -2285,6 +2357,8 @@ async function openEditor(i){
   populateGroupSelect((s.group||'').trim());
   set('f_owner', s.owner); set('f_emoji', s.emoji);
   set('f_icon', s.icon_url); set('f_maxp', s.max_players);
+  set('f_dport', s.display_port);
+  document.getElementById('f_enabled').checked = s.enabled !== false;
   set('f_webhook', s.webhook_url);
   set('f_webhooks', (s.webhooks||[]).join('\n'));
   set('f_role', s.ping_role_id); set('f_ping', s.ping_id);
@@ -2301,11 +2375,15 @@ async function openEditor(i){
     : 'This server will be recorded as created by you.';
   let ulist = [];
   try{ const r2 = await api('/api/users/simple'); if (r2.ok) ulist = await r2.json(); }catch(e){}
-  document.getElementById('editorchecks').innerHTML = ulist.length
+  // Hide users who already have access no matter what: the creator and yourself.
+  const hiddenIds = new Set([s.created_by, ME.steamid].filter(Boolean));
+  const others = ulist.filter(u=>!hiddenIds.has(u.steamid));
+  renderedEditorIds = others.map(u=>u.steamid);
+  document.getElementById('editorchecks').innerHTML = others.length
     ? '<div class="mut" style="margin-bottom:4px">Additional editors (besides the creator and admins):</div>' +
-      ulist.map(u=>`<label style="display:inline-flex;align-items:center;gap:6px;margin:2px 12px 2px 0;font-size:13px;color:var(--fg)">
+      others.map(u=>`<label style="display:inline-flex;align-items:center;gap:6px;margin:2px 12px 2px 0;font-size:13px;color:var(--fg)">
         <input type="checkbox" value="${esc(u.steamid)}" ${(s.editors||[]).includes(u.steamid)?'checked':''} style="width:auto">${esc(u.name)}</label>`).join('')
-    : '<span class="mut">No Steam users yet — add users (Users tab) to grant per-server edit access.</span>';
+    : '<span class="mut">No other users to add — the creator and admins always have edit access.</span>';
   document.getElementById('mtitle').textContent = i>=0 ? 'Edit server — '+(s.name||'') : 'Add server';
   document.getElementById('mmsg').innerHTML = '';
   document.getElementById('modal').hidden = false;
@@ -2325,10 +2403,15 @@ function collectServer(){
   optStr('icon_url','f_icon'); optStr('webhook_url','f_webhook');
   optStr('ping_role_id','f_role'); optStr('ping_id','f_ping'); optStr('timezone','f_tz');
   const mp = v('f_maxp'); if (mp) o.max_players = parseInt(mp,10); else delete o.max_players;
+  const dp = v('f_dport'); if (dp) o.display_port = parseInt(dp,10); else delete o.display_port;
+  if (document.getElementById('f_enabled').checked) delete o.enabled; else o.enabled = false;
   const hooks = v('f_webhooks').split('\n').map(x=>x.trim()).filter(Boolean);
   if (hooks.length) o.webhooks = hooks; else delete o.webhooks;
   delete o._can_edit;
-  const eds = [...document.querySelectorAll('#editorchecks input:checked')].map(x=>x.value);
+  const rendered = new Set(renderedEditorIds);
+  const kept = ((editOrig && editOrig.editors) || []).filter(x=>!rendered.has(x));
+  const checked = [...document.querySelectorAll('#editorchecks input:checked')].map(x=>x.value);
+  const eds = [...new Set([...kept, ...checked])];
   if (eds.length) o.editors = eds; else delete o.editors;
   const tri = (key,id)=>{const x=v(id); if(x==='') delete o[key]; else o[key]=(x==='true');};
   tri('disable_pings','f_disable'); tri('show_players','f_showp');
@@ -2362,6 +2445,18 @@ async function saveServer(){
       closeModal(); loadServers();
     }
     else el.innerHTML = '<div class="err">'+esc(d.error || 'save failed')+'</div>';
+  }catch(e){}
+}
+
+async function toggleServer(i){
+  const o = Object.assign({}, serversCache[i]);
+  delete o._can_edit;
+  if (o.enabled === false) delete o.enabled; else o.enabled = false;
+  try{
+    const r = await api('/api/servers/'+i, {method:'PUT', body: JSON.stringify(o)});
+    const d = await r.json().catch(()=>({}));
+    if (r.ok) loadServers();
+    else alert(d.error || 'toggle failed');
   }catch(e){}
 }
 
@@ -2527,12 +2622,12 @@ async function loadUsers(){
       return;
     }
     el.innerHTML = '<table style="width:100%;border-collapse:collapse;font-size:13px">' +
-      '<tr class="mut" style="text-align:left"><th style="padding:6px">User</th><th>SteamID64</th><th>Role</th><th>Last login</th><th></th></tr>' +
+      '<tr class="mut" style="text-align:left"><th style="padding:6px">User</th><th>SteamID64</th><th>Role</th><th>Last active</th><th></th></tr>' +
       rows.map(([sid,u])=>`<tr style="border-top:1px solid #2a2e3d">
         <td style="padding:6px">${u.avatar?`<img src="${esc(u.avatar)}" style="width:22px;height:22px;border-radius:4px;vertical-align:middle;margin-right:6px">`:''}${esc(u.name||'(unknown)')}</td>
         <td class="mut">${esc(sid)}</td>
         <td><select class="rolesel" data-sid="${esc(sid)}" style="width:auto">${(d.roles||[]).map(x=>`<option ${x===u.role?'selected':''}>${x}</option>`).join('')}</select></td>
-        <td class="mut">${u.last_login?fmtAgo(u.last_login):'never'}</td>
+        <td class="mut">${(u.last_active||u.last_login)?fmtAgo(u.last_active||u.last_login):'never'}</td>
         <td style="text-align:right"><button class="act warn" style="padding:4px 10px" data-usdel="${esc(sid)}">Remove</button></td>
       </tr>`).join('') + '</table>';
     el.querySelectorAll('.rolesel').forEach(s=>s.onchange=async()=>{
@@ -2708,7 +2803,7 @@ setInterval(()=>{ if(activeTab()==='servers') loadServers(); }, 15000);
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.3.4 (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.5.0 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -2741,7 +2836,7 @@ if __name__ == "__main__":
         save_json("has_pinged_down.json", has_pinged_down)
     downtime_counter = {}
     for s in servers:
-        ip, port = s["ip"], s["port"]
+        ip, port = s.get("ip"), s.get("port")  # tolerate malformed entries; validator alerts on them
         key = make_server_key(ip, port)
         server_down.setdefault(key, False)
         has_pinged_down.setdefault(key, False)
@@ -2769,283 +2864,314 @@ if __name__ == "__main__":
 
     # Main loop
     while True:
-
-        # Hot reload servers.json each cycle
-        servers, example_mode = load_servers_and_detect_example_mode()
-
-
-        # Runtime backfill: ensure ping_routes exist for any existing ping messages (first loop & hot-reloads)
         try:
-            _added_rt = False
-            # Build quick ip:port -> server map for this cycle
-            _srv_index = {f"{_s.get('ip')}:{int(_s.get('port', 0))}": _s for _s in servers if _s.get('ip') and _s.get('port')}
-            for _key in list(ping_message_ids.keys()):
-                if _key not in ping_routes:
-                    _s = _srv_index.get(_key)
-                    if _s:
-                        _wh = _server_primary_webhook(_s)
-                        if _wh and not _is_placeholder_webhook(_wh):
-                            ping_routes[_key] = _wh
-                            _added_rt = True
-            if _added_rt:
-                save_json("ping_routes.json", ping_routes)
-        except Exception:
-            pass
 
-        # Reconcile state dicts vs current servers.json
-                # Reconcile route keys (handles group/webhook changes)
-        expected_route_keys = set()
-        for s in servers:
-            hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
-            merge_key = get_merge_group_key(s)
-            for wh in hooks:
-                expected_route_keys.add(route_key(merge_key, wh))
+            # Hot reload servers.json each cycle
+            servers, example_mode = load_servers_and_detect_example_mode()
+            # Disabled servers are treated as absent: not queried, and the route
+            # reconciliation below cleans up their status messages and pings.
+            servers = [s for s in servers if s.get("enabled", True) is not False]
 
-        stale_routes = [rk for rk in list(message_ids.keys()) if rk not in expected_route_keys]
-        if stale_routes:
-            logger.info("[CLEANUP] Routes changed or removed: %s", stale_routes)
-            for rk in stale_routes:
-                msg_id = message_ids.pop(rk, None)
-                try:
-                    merge_key, wh = rk.split("|", 1)
-                except ValueError:
-                    wh = DEFAULT_WEBHOOK_URL
-                if msg_id:
-                    delete_discord_message(msg_id, wh, label=f"stale/changed route {rk}")
-            save_json("message_ids.json", message_ids)
-        active_keys = {f"{s['ip']}:{s['port']}" for s in servers}
-        for key in list(server_down.keys()):
-            if key not in active_keys:
-                server_down.pop(key, None)
-                has_pinged_down.pop(key, None)
-        for key in list(downtime_counter.keys()):
-            if key not in active_keys:
-                downtime_counter.pop(key, None)
-        removed_with_pings = [k for k in list(ping_message_ids.keys()) if k not in active_keys]
-        for key in removed_with_pings:
-            msg_id = ping_message_ids.pop(key, None)
-            webhook = ping_routes.pop(key, DEFAULT_WEBHOOK_URL)
-            if msg_id:
-                delete_discord_message(msg_id, webhook, label=f"removed-server ping {key}")
-        if removed_with_pings:
-            save_json("ping_message_ids.json", ping_message_ids)
-            save_json("ping_routes.json", ping_routes)
-        up_count = 0
-        down_count = 0
 
-        # --- network health guard (net-freeze) ---
-        if net_probe_ok():
-            _net_ok_streak += 1; _net_fail_streak = 0
-            if NET_FREEZE_ACTIVE and _net_ok_streak >= 2:
-                NET_FREEZE_ACTIVE = False
-                dur = None
-                try:
-                    dur = int(time.time() - (NET_OUTAGE_STARTED_AT or time.time()))
-                except Exception:
-                    pass
-                NET_OUTAGE_STARTED_AT = None
-                _save_net_state()
-                alert_issue("Network outage recovered", f"Host connectivity restored after ~{dur}s.",
-                            {"duration_s": dur}, key="net:outage:recovered")
-                alert_resolve("net:outage")
-                logger.info("[NET] Recovered: leaving net-freeze (updates resume).")
-        else:
-            _net_fail_streak += 1; _net_ok_streak = 0
-            if not NET_FREEZE_ACTIVE and _net_fail_streak >= 3:
-                NET_FREEZE_ACTIVE = True
-                NET_OUTAGE_STARTED_AT = time.time()
-                _save_net_state()
-                try:
-                    with open("net_outages.jsonl", "a", encoding="utf-8") as f:
-                        f.write(json.dumps({"started_at": NET_OUTAGE_STARTED_AT}) + "\n")
-                except Exception:
-                    pass
-                alert_issue("Network outage suspected",
-                            "Host appears offline to Discord/DNS. Freezing counters, pings, and cleanup until connectivity recovers.",
-                            {"fails": _net_fail_streak}, key="net:outage")
-                logger.info("[NET] Entered net-freeze: suppressing pings, freezing counters, skipping cleanup.")
+            # Runtime backfill: ensure ping_routes exist for any existing ping messages (first loop & hot-reloads)
+            try:
+                _added_rt = False
+                # Build quick ip:port -> server map for this cycle
+                _srv_index = {f"{_s.get('ip')}:{int(_s.get('port', 0))}": _s for _s in servers if _s.get('ip') and _s.get('port')}
+                for _key in list(ping_message_ids.keys()):
+                    if _key not in ping_routes:
+                        _s = _srv_index.get(_key)
+                        if _s:
+                            _wh = _server_primary_webhook(_s)
+                            if _wh and not _is_placeholder_webhook(_wh):
+                                ping_routes[_key] = _wh
+                                _added_rt = True
+                if _added_rt:
+                    save_json("ping_routes.json", ping_routes)
+            except Exception:
+                pass
 
-        # --- Optional Steam health gate ---
-        prev_unhealthy = _last_steam_unhealthy
-        steam_unhealthy = steam_is_unhealthy() if (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED) else False
-        if not (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED):
-            _last_steam_unhealthy = False
-
-        if steam_unhealthy and not prev_unhealthy:
+            # Reconcile state dicts vs current servers.json
+                    # Reconcile route keys (handles group/webhook changes)
+            expected_route_keys = set()
             for s in servers:
-                key = make_server_key(s["ip"], s["port"])
-                if not server_down.get(key, False):
-                    downtime_counter[key] = 0
-            logger.info("[INFO] Entered Steam outage freeze: counters reset to 0 (non-down servers) & frozen until recovery.")
-        if (not steam_unhealthy) and prev_unhealthy:
-            logger.info("[INFO] Steam recovered: counters will resume normal increments.")
-
-        steam_banner = build_steam_banner(steam_unhealthy, _last_steam_check, _last_steam_snapshot)
-
-        # --- Build routes and gather stats ---
-        grouped_routes = {}
-        _web_servers = []
-
-        for s in servers:
-            name = s["name"]
-            ip, port = s["ip"], s["port"]
-            key = make_server_key(ip, port)
-
-            stats = fetch_stats(ip, port)
-            _wpc = (stats or {}).get("players", 0)
-            if stats and not stats.get("player_names") and bool(s.get("ghost_player_fix", GHOST_PLAYER_FIX_BY_DEFAULT)):
-                _wpc = 0
-            _web_servers.append({
-                "name": name, "ip": ip, "port": port,
-                "group": get_display_group(s),
-                "up": bool(stats),
-                "map": (stats or {}).get("map"),
-                "players": _wpc,
-                "max_players": (stats or {}).get("max_players", s.get("max_players", 0)),
-                "player_names": (stats or {}).get("player_names", []),
-                "down_marked": bool(server_down.get(key, False)),
-                "fail_streak": int(downtime_counter.get(key, 0)),
-                "downtime_total": get_downtime_count_for(s),
-            })
-            if stats:
                 hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
-                for server_hook in hooks:
-                    merge_key = get_merge_group_key(s)
-                    rk = route_key(merge_key, server_hook)
-                    grouped_routes.setdefault(rk, []).append((s, stats))
+                merge_key = get_merge_group_key(s)
+                for wh in hooks:
+                    expected_route_keys.add(route_key(merge_key, wh))
 
-                up_count += 1
-                logger.info("[%s] %s is up: %s on %s", datetime.now(), name, stats['players'], stats['map'])
+            stale_routes = [rk for rk in list(message_ids.keys()) if rk not in expected_route_keys]
+            if stale_routes:
+                logger.info("[CLEANUP] Routes changed or removed: %s", stale_routes)
+                for rk in stale_routes:
+                    msg_id = message_ids.pop(rk, None)
+                    try:
+                        merge_key, wh = rk.split("|", 1)
+                    except ValueError:
+                        wh = DEFAULT_WEBHOOK_URL
+                    if msg_id:
+                        delete_discord_message(msg_id, wh, label=f"stale/changed route {rk}")
+                save_json("message_ids.json", message_ids)
+            active_keys = {f"{s['ip']}:{s['port']}" for s in servers}
+            for key in list(server_down.keys()):
+                if key not in active_keys:
+                    server_down.pop(key, None)
+                    has_pinged_down.pop(key, None)
+            for key in list(downtime_counter.keys()):
+                if key not in active_keys:
+                    downtime_counter.pop(key, None)
+            removed_with_pings = [k for k in list(ping_message_ids.keys()) if k not in active_keys]
+            for key in removed_with_pings:
+                msg_id = ping_message_ids.pop(key, None)
+                webhook = ping_routes.pop(key, DEFAULT_WEBHOOK_URL)
+                if msg_id:
+                    delete_discord_message(msg_id, webhook, label=f"removed-server ping {key}")
+            if removed_with_pings:
+                save_json("ping_message_ids.json", ping_message_ids)
+                save_json("ping_routes.json", ping_routes)
+            up_count = 0
+            down_count = 0
 
-                # Recover logic
-                if server_down.get(key, False):
-                    server_down[key] = False
-                    downtime_counter[key] = 0
-                    has_pinged_down[key] = False
-                
-                    # Clean up ping message only if it existed (won't for disable_pings)
-                    if key in ping_message_ids:
-                        try:
-                            delete_ping_url = ping_routes.get(key, _server_primary_webhook(s))
-                            msg_id = ping_message_ids.get(key)
-                            if msg_id and delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
-                                delete_discord_message(msg_id, delete_ping_url, label=f"recovered ping {key}")
-                        except Exception:
-                            pass
-                
-                        ping_message_ids.pop(key, None)
-                        ping_routes.pop(key, None)
-                        save_json("ping_message_ids.json", ping_message_ids)
-                        save_json("ping_routes.json", ping_routes)
-                
-                else:
-                    downtime_counter[key] = 0
-                    has_pinged_down[key] = False
-
+            # --- network health guard (net-freeze) ---
+            if net_probe_ok():
+                _net_ok_streak += 1; _net_fail_streak = 0
+                if NET_FREEZE_ACTIVE and _net_ok_streak >= 2:
+                    NET_FREEZE_ACTIVE = False
+                    dur = None
+                    try:
+                        dur = int(time.time() - (NET_OUTAGE_STARTED_AT or time.time()))
+                    except Exception:
+                        pass
+                    NET_OUTAGE_STARTED_AT = None
+                    _save_net_state()
+                    alert_issue("Network outage recovered", f"Host connectivity restored after ~{dur}s.",
+                                {"duration_s": dur}, key="net:outage:recovered")
+                    alert_resolve("net:outage")
+                    logger.info("[NET] Recovered: leaving net-freeze (updates resume).")
             else:
-                down_count += 1
-                logger.info("[%s] %s is DOWN!", datetime.now(), name)
-                if example_mode:
-                    continue
-                if steam_unhealthy or NET_FREEZE_ACTIVE:
-                    downtime_counter[key] = 0
-                    continue
-                prev = downtime_counter.get(key, 0)
-                cur = prev + 1
-                downtime_counter[key] = cur
-                if cur >= DOWN_FAIL_THRESHOLD:
-                    # Mark server as down
+                _net_fail_streak += 1; _net_ok_streak = 0
+                if not NET_FREEZE_ACTIVE and _net_fail_streak >= 3:
+                    NET_FREEZE_ACTIVE = True
+                    NET_OUTAGE_STARTED_AT = time.time()
+                    _save_net_state()
+                    try:
+                        with open("net_outages.jsonl", "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"started_at": NET_OUTAGE_STARTED_AT}) + "\n")
+                    except Exception:
+                        pass
+                    alert_issue("Network outage suspected",
+                                "Host appears offline to Discord/DNS. Freezing counters, pings, and cleanup until connectivity recovers.",
+                                {"fails": _net_fail_streak}, key="net:outage")
+                    logger.info("[NET] Entered net-freeze: suppressing pings, freezing counters, skipping cleanup.")
+
+            # --- Optional Steam health gate ---
+            prev_unhealthy = _last_steam_unhealthy
+            steam_unhealthy = steam_is_unhealthy() if (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED) else False
+            if not (STEAM_STATUS_CHECK_ENABLED and STEAM_HEALTH_ENABLED):
+                _last_steam_unhealthy = False
+
+            if steam_unhealthy and not prev_unhealthy:
+                for s in servers:
+                    key = make_server_key(s["ip"], s["port"])
                     if not server_down.get(key, False):
-                        server_down[key] = True
-                
-                    # NEW: disable_pings flag
-                    pings_disabled = bool(s.get("disable_pings", False))
-                
-                    # If pings are disabled, do NOT post downtime pings
-                    if pings_disabled:
-                        has_pinged_down[key] = False
-                    else:
-                        # Normal ping behavior
-                        if not has_pinged_down.get(key, False):
-                            if key not in ping_message_ids:
-                                pid = post_ping(s)
-                                if pid:
-                                    ping_message_ids[key] = pid
-                                    has_pinged_down[key] = True
-                                    save_json("has_pinged_down.json", has_pinged_down)
-                                    webhook_url = _server_primary_webhook(s)
-                                    ping_routes[key] = webhook_url
-                                    save_json("ping_message_ids.json", ping_message_ids)
-                                    save_json("ping_routes.json", ping_routes)
-                                    _inc_downtime_counter_for(s)
-                
-# If we haven't sent a downtime ping yet, keep this server visible with an unreachable banner
-                if not has_pinged_down.get(key, False):
-                    display_stats = {
-                        "name": s.get("name"),
-                        "map": UNREACHABLE_MAP,
-                        "players": 0,
-                        "max_players": s.get("max_players", 0),
-                        "player_names": [],
-                        "password_protected": None,
-                        "queried_name": s.get("name"),
-                    }
+                        downtime_counter[key] = 0
+                logger.info("[INFO] Entered Steam outage freeze: counters reset to 0 (non-down servers) & frozen until recovery.")
+            if (not steam_unhealthy) and prev_unhealthy:
+                logger.info("[INFO] Steam recovered: counters will resume normal increments.")
+
+            steam_banner = build_steam_banner(steam_unhealthy, _last_steam_check, _last_steam_snapshot)
+
+            # --- Build routes and gather stats ---
+            grouped_routes = {}
+            _web_servers = []
+
+            # Query every server concurrently: serial queries made cycles overrun the
+            # interval once a few servers were down (each one burns its full timeout).
+            # All state updates still happen sequentially in this thread below.
+            stats_by_key = {}
+            if servers:
+                _workers = max(1, min(int(QUERY_MAX_WORKERS), len(servers)))
+                with ThreadPoolExecutor(max_workers=_workers, thread_name_prefix="a2s") as _pool:
+                    _futs = {}
+                    for s in servers:
+                        _k = make_server_key(s.get("ip"), s.get("port"))
+                        if _k not in _futs:
+                            _futs[_k] = _pool.submit(fetch_stats, s.get("ip"), s.get("port"))
+                    for _k, _f in _futs.items():
+                        try:
+                            stats_by_key[_k] = _f.result()
+                        except Exception as _e:
+                            logger.warning("[QUERY] Worker error for %s: %s", _k, _e)
+                            stats_by_key[_k] = None
+
+            for s in servers:
+                name = s["name"]
+                ip, port = s["ip"], s["port"]
+                key = make_server_key(ip, port)
+
+                stats = stats_by_key.get(key)
+                _wpc = (stats or {}).get("players", 0)
+                if stats and not stats.get("player_names") and bool(s.get("ghost_player_fix", GHOST_PLAYER_FIX_BY_DEFAULT)):
+                    _wpc = 0
+                _web_servers.append({
+                    "name": name, "ip": ip, "port": port,
+                    "group": get_display_group(s),
+                    "up": bool(stats),
+                    "map": (stats or {}).get("map"),
+                    "players": _wpc,
+                    "max_players": (stats or {}).get("max_players", s.get("max_players", 0)),
+                    "player_names": (stats or {}).get("player_names", []),
+                    "down_marked": bool(server_down.get(key, False)),
+                    "fail_streak": int(downtime_counter.get(key, 0)),
+                    "downtime_total": get_downtime_count_for(s),
+                })
+                if stats:
                     hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
                     for server_hook in hooks:
                         merge_key = get_merge_group_key(s)
                         rk = route_key(merge_key, server_hook)
-                        grouped_routes.setdefault(rk, []).append((s, display_stats))
+                        grouped_routes.setdefault(rk, []).append((s, stats))
 
-        logger.info("[CYCLE] Up: %s  Down: %s  Routes: %s", up_count, down_count, len(grouped_routes))
-        WEB_STATE.update({
-            "servers": _web_servers,
-            "last_cycle": time.time(),
-            "up": up_count,
-            "down": down_count,
-            "steam_unhealthy": bool(steam_unhealthy),
-            "net_freeze": bool(NET_FREEZE_ACTIVE),
-            "example_mode": bool(example_mode),
-        })
+                    up_count += 1
+                    logger.info("[%s] %s is up: %s on %s", datetime.now(), name, stats['players'], stats['map'])
 
-        # (v2.3.0) The optional STALE_PURGE block that lived here was removed — the
-        # route reconciliation at the top of the loop already deletes messages for
-        # stale/changed routes every cycle.
+                    # Recover logic
+                    if server_down.get(key, False):
+                        server_down[key] = False
+                        downtime_counter[key] = 0
+                        has_pinged_down[key] = False
+                
+                        # Clean up ping message only if it existed (won't for disable_pings)
+                        if key in ping_message_ids:
+                            try:
+                                delete_ping_url = ping_routes.get(key, _server_primary_webhook(s))
+                                msg_id = ping_message_ids.get(key)
+                                if msg_id and delete_ping_url and not _is_placeholder_webhook(delete_ping_url):
+                                    delete_discord_message(msg_id, delete_ping_url, label=f"recovered ping {key}")
+                            except Exception:
+                                pass
+                
+                            ping_message_ids.pop(key, None)
+                            ping_routes.pop(key, None)
+                            save_json("ping_message_ids.json", ping_message_ids)
+                            save_json("ping_routes.json", ping_routes)
+                
+                    else:
+                        downtime_counter[key] = 0
+                        has_pinged_down[key] = False
 
-        # --- Build and send/edit embeds per route ---        # --- Build and send/edit embeds per route ---
-        # Always purge obviously invalid stored routes that point to placeholder DEFAULT webhook
-        _invalid_routes = [rk for rk in list(message_ids.keys()) if ("|" in rk and _is_placeholder_webhook(rk.split("|",1)[1]))]
-        if _invalid_routes:
-            logger.info("[CLEANUP] Dropping placeholder-webhook routes from message_ids: %s", _invalid_routes)
-            for rk in _invalid_routes:
-                message_ids.pop(rk, None)
-            save_json("message_ids.json", message_ids)
-
-        if grouped_routes:
-            for rk, pairs in grouped_routes.items():
-                merge_key, webhook_url = rk.split("|", 1)
-                display_label = get_display_group(pairs[0][0])
-                # Only annotate GROUPED routes. Appending to an empty label made it
-                # truthy, which flipped ungrouped servers into the consolidated group
-                # layout while unreachable — the "random formatting change" bug.
-                if display_label and all((ps.get('map') == UNREACHABLE_MAP) for (_sv, ps) in pairs):
-                    display_label += ' ⚠️ Temporarily unreachable'
-                embeds = build_grouped_embeds({display_label: pairs}, steam_banner=steam_banner)[display_label]
-                if rk in message_ids:
-                    edit_discord_message(display_label, message_ids[rk], embeds, webhook_url, rk)
                 else:
-                    if _is_placeholder_webhook(webhook_url):
-                        alert_issue("Default webhook not set", "Cannot create status message: webhook is placeholder or empty.",
-                                    {"group": display_label or "(no group)", "webhook": str(webhook_url)[:80]}, key=f"missing:init:{display_label}")
+                    down_count += 1
+                    logger.info("[%s] %s is DOWN!", datetime.now(), name)
+                    if example_mode:
                         continue
-                    new_ids = send_initial_messages({display_label: embeds}, {display_label: webhook_url})
-                    if display_label in new_ids:
-                        message_ids[rk] = new_ids[display_label]
-                        save_json("message_ids.json", message_ids)
-                        alert_resolve(f"post:init:{display_label}|{webhook_url}")
+                    if steam_unhealthy or NET_FREEZE_ACTIVE:
+                        downtime_counter[key] = 0
+                        continue
+                    prev = downtime_counter.get(key, 0)
+                    cur = prev + 1
+                    downtime_counter[key] = cur
+                    if cur >= DOWN_FAIL_THRESHOLD:
+                        # Mark server as down
+                        if not server_down.get(key, False):
+                            server_down[key] = True
+                
+                        # NEW: disable_pings flag
+                        pings_disabled = bool(s.get("disable_pings", False))
+                
+                        # If pings are disabled, do NOT post downtime pings
+                        if pings_disabled:
+                            has_pinged_down[key] = False
+                        else:
+                            # Normal ping behavior
+                            if not has_pinged_down.get(key, False):
+                                if key not in ping_message_ids:
+                                    pid = post_ping(s)
+                                    if pid:
+                                        ping_message_ids[key] = pid
+                                        has_pinged_down[key] = True
+                                        save_json("has_pinged_down.json", has_pinged_down)
+                                        webhook_url = _server_primary_webhook(s)
+                                        ping_routes[key] = webhook_url
+                                        save_json("ping_message_ids.json", ping_message_ids)
+                                        save_json("ping_routes.json", ping_routes)
+                                        _inc_downtime_counter_for(s)
+                
+    # If we haven't sent a downtime ping yet, keep this server visible with an unreachable banner
+                    if not has_pinged_down.get(key, False):
+                        display_stats = {
+                            "name": s.get("name"),
+                            "map": UNREACHABLE_MAP,
+                            "players": 0,
+                            "max_players": s.get("max_players", 0),
+                            "player_names": [],
+                            "password_protected": None,
+                            "queried_name": s.get("name"),
+                        }
+                        hooks = s.get("webhooks") or [s.get("webhook_url", DEFAULT_WEBHOOK_URL)]
+                        for server_hook in hooks:
+                            merge_key = get_merge_group_key(s)
+                            rk = route_key(merge_key, server_hook)
+                            grouped_routes.setdefault(rk, []).append((s, display_stats))
 
-        # Persist state each loop
-        save_json("server_down.json", server_down)
-        save_json("has_pinged_down.json", has_pinged_down)
+            logger.info("[CYCLE] Up: %s  Down: %s  Routes: %s", up_count, down_count, len(grouped_routes))
+            WEB_STATE.update({
+                "servers": _web_servers,
+                "last_cycle": time.time(),
+                "up": up_count,
+                "down": down_count,
+                "steam_unhealthy": bool(steam_unhealthy),
+                "net_freeze": bool(NET_FREEZE_ACTIVE),
+                "example_mode": bool(example_mode),
+            })
+
+            # (v2.3.0) The optional STALE_PURGE block that lived here was removed — the
+            # route reconciliation at the top of the loop already deletes messages for
+            # stale/changed routes every cycle.
+
+            # --- Build and send/edit embeds per route ---        # --- Build and send/edit embeds per route ---
+            # Always purge obviously invalid stored routes that point to placeholder DEFAULT webhook
+            _invalid_routes = [rk for rk in list(message_ids.keys()) if ("|" in rk and _is_placeholder_webhook(rk.split("|",1)[1]))]
+            if _invalid_routes:
+                logger.info("[CLEANUP] Dropping placeholder-webhook routes from message_ids: %s", _invalid_routes)
+                for rk in _invalid_routes:
+                    message_ids.pop(rk, None)
+                save_json("message_ids.json", message_ids)
+
+            if grouped_routes:
+                for rk, pairs in grouped_routes.items():
+                    merge_key, webhook_url = rk.split("|", 1)
+                    display_label = get_display_group(pairs[0][0])
+                    # Only annotate GROUPED routes. Appending to an empty label made it
+                    # truthy, which flipped ungrouped servers into the consolidated group
+                    # layout while unreachable — the "random formatting change" bug.
+                    if display_label and all((ps.get('map') == UNREACHABLE_MAP) for (_sv, ps) in pairs):
+                        display_label += ' ⚠️ Temporarily unreachable'
+                    embeds = build_grouped_embeds({display_label: pairs}, steam_banner=steam_banner)[display_label]
+                    if rk in message_ids:
+                        edit_discord_message(display_label, message_ids[rk], embeds, webhook_url, rk)
+                    else:
+                        if _is_placeholder_webhook(webhook_url):
+                            alert_issue("Default webhook not set", "Cannot create status message: webhook is placeholder or empty.",
+                                        {"group": display_label or "(no group)", "webhook": str(webhook_url)[:80]}, key=f"missing:init:{display_label}")
+                            continue
+                        new_ids = send_initial_messages({display_label: embeds}, {display_label: webhook_url})
+                        if display_label in new_ids:
+                            message_ids[rk] = new_ids[display_label]
+                            save_json("message_ids.json", message_ids)
+                            alert_resolve(f"post:init:{display_label}|{webhook_url}")
+
+            # Persist state each loop
+            save_json("server_down.json", server_down)
+            save_json("has_pinged_down.json", has_pinged_down)
+        except Exception:
+            logger.error("[CRASH-GUARD] Cycle failed:\n%s", traceback.format_exc())
+            try:
+                alert_issue("Bot cycle crashed",
+                            "The main loop hit an unexpected error; the bot is still running and will retry next cycle.",
+                            {"error": traceback.format_exc()[-900:]}, key="crash:mainloop")
+            except Exception:
+                pass
 
         FORCE_REFRESH.wait(INTERVAL_SECONDS)  # interruptible: web UI "Refresh now"
         FORCE_REFRESH.clear()
