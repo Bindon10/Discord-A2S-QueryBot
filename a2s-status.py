@@ -1,7 +1,7 @@
 # ============================================================
 #
 # Discord-A2S-QueryBot
-# Version: v2.5.0
+# Version: v2.5.1
 #
 # ============================================================
 
@@ -131,7 +131,7 @@ try:
     SESSION.mount("http://", HTTPAdapter(pool_connections=4, pool_maxsize=8))
 except Exception:
     pass
-SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.5.0"})
+SESSION.headers.update({"User-Agent": "Discord-A2S-QueryBot/2.5.1"})
 
 def _sleep_backoff(attempt: int, base: float = 0.75, cap: float = 5.0):
     delay = min(cap, base * (2 ** attempt)) + random.uniform(0, 0.25)
@@ -1601,7 +1601,7 @@ def start_web_ui():
             return err
         st = dict(WEB_STATE)
         st["interval"] = INTERVAL_SECONDS
-        st["version"] = "2.5.0"
+        st["version"] = "2.5.1"
         st["uptime_s"] = int(time.time() - WEB_STATE.get("started_at", time.time()))
         return jsonify(st)
 
@@ -2803,7 +2803,7 @@ setInterval(()=>{ if(activeTab()==='servers') loadServers(); }, 15000);
 
 # === MAIN ===
 if __name__ == "__main__":
-    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.5.0 (user-config at top)")
+    logger.info("[INIT] Starting Discord-A2S-QueryBot v2.5.1 (user-config at top)")
 
     # Graceful shutdown: flush state
     def _graceful_exit(signum, frame):
@@ -3072,13 +3072,16 @@ if __name__ == "__main__":
                     cur = prev + 1
                     downtime_counter[key] = cur
                     if cur >= DOWN_FAIL_THRESHOLD:
-                        # Mark server as down
+                        # Mark server as down. This block runs once per down
+                        # transition, so the downtime counter is incremented here —
+                        # independent of pings, so 'disable_pings' servers still count.
                         if not server_down.get(key, False):
                             server_down[key] = True
-                
+                            _inc_downtime_counter_for(s)
+
                         # NEW: disable_pings flag
                         pings_disabled = bool(s.get("disable_pings", False))
-                
+
                         # If pings are disabled, do NOT post downtime pings
                         if pings_disabled:
                             has_pinged_down[key] = False
@@ -3095,7 +3098,6 @@ if __name__ == "__main__":
                                         ping_routes[key] = webhook_url
                                         save_json("ping_message_ids.json", ping_message_ids)
                                         save_json("ping_routes.json", ping_routes)
-                                        _inc_downtime_counter_for(s)
                 
     # If we haven't sent a downtime ping yet, keep this server visible with an unreachable banner
                     if not has_pinged_down.get(key, False):
